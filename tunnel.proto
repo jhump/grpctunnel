@@ -1,0 +1,134 @@
+syntax = "proto3";
+
+package grpctunnel;
+
+import "google/protobuf/empty.proto";
+import "google/rpc/status.proto";
+
+service TunnelService {
+    // OpenTunnel creates a channel to the server which can be used to send
+    // additional RPCs, all of which will be sent to the same server via a
+    // single underlying gRPC stream. This can provide affinity for a "chatty"
+    // sequence of calls, where the gRPC connection is load balanced (so there
+    // may be multiple backend servers), but a particular "conversation" (which
+    // may consist of numerous RPCs) needs to all go to a single server, for
+    // consistency.
+    rpc OpenTunnel(stream ClientToServer) returns (stream ServerToClient);
+    // OpenReverseTunnel creates a "reverse" channel, which allows the server to
+    // act as a client and send RPCs to the client that creates the tunnel. It
+    // is in most respects identical to OpenTunnel except that the roles are
+    // reversed: the server initiates RPCs and sends requests and the client
+    // replies to them and sends responses.
+    rpc OpenReverseTunnel(stream ServerToClient) returns (stream ClientToServer);
+}
+
+// ClientToServer is the message a client sends to a server.
+//
+// For a single stream ID, the first such message must include the new_stream
+// field. After that, there can be any number of requests sent, via the
+// request_message field and additional messages thereafter that use the
+// more_request_data field (for requests that are larger than 16kb). And
+// finally, the RPC ends with either the half_close or cancel fields. If the
+// half_close field is used, the RPC stream remains active so the server may
+// continue to send response data. But, if the cancel field is used, the RPC
+// stream is aborted and thus closed on both client and server ends. If a stream
+// has been half-closed, the only allowed message from the client for that
+// stream ID is one with the cancel field, to abort the remainder of the
+// operation.
+message ClientToServer {
+    // The ID of the stream. Stream IDs must be used in increasing order and
+    // cannot be re-used. Unlike in the HTTP/2 protocol, the stream ID is 64-bit
+    // so overflow in a long-lived channel is excessively unlikely. (If the
+    // channel were used for a stream every nanosecond, it would take close to
+    // 300 years to exhaust every ID and reach an overflow situation.)
+    int64 stream_id = 1;
+
+    oneof frame {
+        // Creates a new RPC stream, which includes request header metadata. The
+        // stream ID must not be an already active stream.
+        NewStream new_stream = 2;
+        // Sends a message on the RPC stream. If the message is larger than 16k,
+        // the rest of the message should be sent in chunks using the
+        // more_request_data field (up to 16kb of data in each chunk).
+        MessageData request_message = 3;
+        // Sends a chunk of request data, for a request message that could not
+        // wholly fit in a request_message field (e.g. > 16kb).
+        bytes more_request_data = 4;
+        // Half-closes the stream, signaling that no more request messages will
+        // be sent. No other messages, other than one with the cancel field set,
+        // should be sent for this stream (at least not until it is terminated
+        // by the server, after which the ID can be re-used).
+        google.protobuf.Empty half_close = 5;
+        // Aborts the stream. No other messages should be sent for this stream
+        // (unless the ID is being re-used after the stream is terminated on the
+        // server side).
+        google.protobuf.Empty cancel = 6;
+    }
+}
+
+// ServerToClient is the message a server sends to a client.
+//
+// For a single stream ID, the first such message should include the
+// response_headers field unless no headers are to be sent. After the headers,
+// the server can send any number of responses, via the response_message field
+// and additional messages thereafter that use the more_response_data field (for
+// responses that are larger than 16kb). A message with the close_stream field
+// concludes the stream, whether it terminates successfully or with an error.
+message ServerToClient {
+    // The ID of the stream. Stream IDs are defined by the client and should be
+    // used in monotonically increasing order. They cannot be re-used. Unlike
+    // HTTP/2, the ID is 64-bit, so overflow/re-use should not be an issue. (If
+    // the channel were used for a stream every nanosecond, it would take close
+    // to 300 years to exhaust every ID and reach an overflow situation.)
+    int64 stream_id = 1;
+
+    oneof frame {
+        // Sends response headers for this stream. If headers are sent at all,
+        // they must be sent before any response message data.
+        Metadata response_headers = 2;
+        // Sends a message on the RPC stream. If the message is larger than 16k,
+        // the rest of the message should be sent in chunks using the
+        // more_response_data field (up to 16kb of data in each chunk).
+        MessageData response_message = 3;
+        // Sends a chunk of response data, for a response message that could not
+        // wholly fit in a response_message field (e.g. > 16kb).
+        bytes more_response_data = 4;
+        // Terminates the stream and communicates the final disposition to the
+        // client. After the stream is closed, no other messages should use the
+        // given stream ID until the ID is re-used (e.g. a NewStream message is
+        // received that creates another stream with the same ID).
+        CloseStream close_stream = 5;
+    }
+}
+
+message NewStream {
+    string method_name = 1;
+    Metadata request_headers = 2;
+
+    // TODO: codec/compressor options?
+}
+
+message MessageData {
+    // The full size of the message.
+    int32 size = 1;
+    // The message data. This field should not be longer than 16kb (16,384
+    // bytes). If the full size of the message is larger then it should be
+    // split into multiple chunks. The chunking is done to allow multiple
+    // access to the underlying gRPC stream by concurrent tunneled streams.
+    // If very large messages were sent via a single chunk, it could cause
+    // head-of-line blocking and starvation when multiple streams need to send
+    // data on the one underlying gRPC stream.
+    bytes data = 2;
+}
+
+message CloseStream {
+    Metadata response_trailers = 1;
+    google.rpc.Status status = 2;
+}
+
+message Metadata {
+    message Values {
+        repeated string val = 1;
+    }
+    map<string, Values> md = 1;
+}
