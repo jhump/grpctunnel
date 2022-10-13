@@ -1,18 +1,19 @@
 package grpctunnel
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
+	"sync"
+
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes/empty"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
-	"io"
-	"sync"
 )
 
 func NewChannel(stream TunnelService_OpenTunnelClient) *TunnelChannel {
@@ -37,7 +38,7 @@ type ReverseTunnelChannel struct {
 }
 
 type tunnelStreamClient interface {
-	grpc.Stream
+	Context() context.Context
 	Send(*ClientToServer) error
 	Recv() (*ServerToClient, error)
 }
@@ -126,7 +127,7 @@ func (c *TunnelChannel) newStream(ctx context.Context, clientStreams, serverStre
 	if err != nil {
 		return nil, err
 	}
-	err = c.stream.SendMsg(&ClientToServer{
+	err = c.stream.Send(&ClientToServer{
 		StreamId: str.streamID,
 		Frame: &ClientToServer_NewStream{
 			NewStream: &NewStream{
@@ -277,7 +278,7 @@ func (c *TunnelChannel) removeStream(streamID int64) {
 
 func (c *TunnelChannel) close(err error) bool {
 	if c.tearDown != nil {
-		c.tearDown()
+		_ = c.tearDown()
 	}
 
 	c.mu.Lock()
@@ -601,7 +602,7 @@ func (st *tunnelClientStream) cancel(err error) {
 	// let server know
 	st.writeMu.Lock()
 	defer st.writeMu.Unlock()
-	st.stream.Send(&ClientToServer{
+	_ = st.stream.Send(&ClientToServer{
 		StreamId: st.streamID,
 		Frame: &ClientToServer_Cancel{
 			Cancel: &empty.Empty{},

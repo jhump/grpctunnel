@@ -1,13 +1,14 @@
 package grpctunnel
 
 import (
+	"context"
 	"fmt"
-	"golang.org/x/net/context"
-	"google.golang.org/grpc"
 	"io"
 	"reflect"
 	"sync"
 	"sync/atomic"
+
+	"google.golang.org/grpc"
 )
 
 // CorruptResponseStreamError is an error that occurs when a correlated stream

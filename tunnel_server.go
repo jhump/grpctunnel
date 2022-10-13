@@ -1,6 +1,7 @@
 package grpctunnel
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,7 +10,6 @@ import (
 
 	"github.com/fullstorydev/grpchan"
 	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -77,7 +77,7 @@ func serveTunnel(stream tunnelStreamServer, handlers grpchan.HandlerMap) error {
 }
 
 type tunnelStreamServer interface {
-	grpc.Stream
+	Context() context.Context
 	Send(*ServerToClient) error
 	Recv() (*ClientToServer, error)
 }
@@ -109,7 +109,7 @@ func (s *tunnelServer) serve() error {
 					return err
 				} else {
 					st, _ := status.FromError(err)
-					s.stream.Send(&ServerToClient{
+					_ = s.stream.Send(&ServerToClient{
 						StreamId: in.StreamId,
 						Frame: &ServerToClient_CloseStream{
 							CloseStream: &CloseStream{
@@ -341,7 +341,7 @@ func toProto(md metadata.MD) *Metadata {
 }
 
 func (st *tunnelServerStream) SetTrailer(md metadata.MD) {
-	st.setTrailer(md)
+	_ = st.setTrailer(md)
 }
 
 func (st *tunnelServerStream) setTrailer(md metadata.MD) error {
@@ -364,7 +364,9 @@ func (st *tunnelServerStream) SendMsg(m interface{}) error {
 	defer st.writeMu.Unlock()
 
 	if !st.sentHeaders {
-		st.sendHeadersLocked()
+		if err := st.sendHeadersLocked(); err != nil {
+			return err
+		}
 	}
 
 	if !st.isServerStream && st.numSent == 1 {
@@ -562,11 +564,11 @@ func (st *tunnelServerStream) finishStream(err error) {
 	}
 
 	if !st.sentHeaders {
-		st.sendHeadersLocked()
+		_ = st.sendHeadersLocked()
 	}
 
 	stat, _ := status.FromError(err)
-	st.stream.Send(&ServerToClient{
+	_ = st.stream.Send(&ServerToClient{
 		StreamId: st.streamID,
 		Frame: &ServerToClient_CloseStream{
 			CloseStream: &CloseStream{

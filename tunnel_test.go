@@ -1,6 +1,7 @@
 package grpctunnel
 
 import (
+	"context"
 	"net"
 	"runtime"
 	"testing"
@@ -8,8 +9,10 @@ import (
 
 	"github.com/fullstorydev/grpchan"
 	"github.com/fullstorydev/grpchan/grpchantesting"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 func TestTunnelServer(t *testing.T) {
@@ -27,7 +30,7 @@ func TestTunnelServer(t *testing.T) {
 			}
 		},
 	}
-	grpchantesting.RegisterHandlerTestService(&ts, &svr)
+	grpchantesting.RegisterTestServiceServer(&ts, &svr)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -35,14 +38,20 @@ func TestTunnelServer(t *testing.T) {
 	}
 	gs := grpc.NewServer()
 	RegisterTunnelServiceServer(gs, &ts)
-	go gs.Serve(l)
+	go func() {
+		if err := gs.Serve(l); err != nil {
+			t.Logf("error from grpc server: %v", err)
+		}
+	}()
 	defer gs.Stop()
 
-	cc, err := grpc.Dial(l.Addr().String(), grpc.WithBlock(), grpc.WithInsecure())
+	cc, err := grpc.Dial(l.Addr().String(), grpc.WithBlock(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer cc.Close()
+	defer func() {
+		_ = cc.Close()
+	}()
 
 	cli := NewTunnelServiceClient(cc)
 
@@ -62,23 +71,39 @@ func TestTunnelServer(t *testing.T) {
 
 	t.Run("reverse", func(t *testing.T) {
 		checkForGoroutineLeak(t, func() {
-			tunnel, err := cli.OpenReverseTunnel(context.Background())
+			ctx, cancel := context.WithCancel(context.Background())
+			tunnel, err := cli.OpenReverseTunnel(ctx)
 			if err != nil {
 				t.Fatalf("failed to open reverse tunnel: %v", err)
 			}
 
 			// client now acts as the server
 			handlerMap := grpchan.HandlerMap{}
-			grpchantesting.RegisterHandlerTestService(handlerMap, &svr)
+			grpchantesting.RegisterTestServiceServer(handlerMap, &svr)
 			errs := make(chan error)
 			go func() {
 				errs <- ServeReverseTunnel(tunnel, handlerMap)
 			}()
 
 			defer func() {
-				tunnel.CloseSend()
+				// TODO: using CloseSend to stop the server can cause errors where "server" (actually
+				//  running in the client) tries to send cancellations, but that results in internal
+				//  error for whole tunnel RPC due to trying to call SendMsg on a stream after
+				//  CloseSend is called.
+				//  The right way to do this would be to expose a stop or graceful shutdown mechanism
+				//  from the reverse server, which is what can call CloseSend but also prevent any
+				//  subsequent attempts to SendMsg.
+				//if err := tunnel.CloseSend(); err != nil {
+				//	t.Logf("error half-closing ServeReverseTunnel stream: %v", err)
+				//}
+
+				// Shutdown via cancelling the context used to create the stream.
+				cancel()
+
 				err := <-errs
-				if err != nil {
+				// we expect an error related to the above cancellation
+				stat, isStatusError := status.FromError(err)
+				if err != nil && err != context.Canceled && (!isStatusError || stat.Code() != codes.Canceled) {
 					t.Errorf("ServeReverseTunnel returned error: %v", err)
 				}
 			}()
