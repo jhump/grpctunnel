@@ -1,0 +1,11 @@
+version: v1
+plugins:
+  - name: go
+    out: ../
+    opt:
+      - Mgrpctunnel/v1/tunnel.proto=./
+  - name: go-grpc
+    out: ../
+    opt:
+      - Mgrpctunnel/v1/tunnel.proto=./
+      - require_unimplemented_servers=false

@@ -1,9 +1,11 @@
 syntax = "proto3";
 
-package grpctunnel;
+package grpctunnel.v1;
 
 import "google/protobuf/empty.proto";
 import "google/rpc/status.proto";
+
+option go_package = "github.com/jhump/grpctunnel";
 
 service TunnelService {
     // OpenTunnel creates a channel to the server which can be used to send

@@ -12,4 +12,4 @@
 // client (and the client then replies and sends responses back to the server).
 package grpctunnel
 
-//go:generate protoc -I ./googleapis/ -I $GOPATH/src --go_out=plugins=grpc:$GOPATH/src github.com/jhump/grpctunnel/tunnel.proto
+//go:generate bash -c "cd proto && buf generate"
