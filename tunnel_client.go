@@ -401,7 +401,7 @@ func (st *tunnelClientStream) SendMsg(m interface{}) error {
 	defer st.writeMu.Unlock()
 
 	if !st.isClientStream && st.numSent == 1 {
-		return status.Errorf(codes.Internal, "Already sent response for non-server-stream method %d", st.method)
+		return status.Errorf(codes.Internal, "Already sent response for non-server-stream method %s", st.method)
 	}
 	st.numSent++
 
@@ -478,7 +478,7 @@ func (st *tunnelClientStream) readMsg() (data []byte, err error, ok bool) {
 		// and fail RPC if so (due to bad input)
 		_, err, ok := st.readMsgLocked()
 		if err == nil {
-			err = status.Errorf(codes.Internal, "Server sent multiple responses for non-server-stream method %d", st.method)
+			err = status.Errorf(codes.Internal, "Server sent multiple responses for non-server-stream method %s", st.method)
 			st.readErr = err
 			return nil, err, false
 		}

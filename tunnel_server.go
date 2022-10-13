@@ -29,10 +29,9 @@ const maxChunkSize = 16384
 // This is typically called from a handler that implements the TunnelService.
 // Typical usage looks like so:
 //
-//    func (h tunnelHandler) OpenTunnel(stream grpctunnel.TunnelService_OpenTunnelServer) error {
-//        return grpctunnel.ServeTunnel(stream, h.handlers)
-//    }
-//
+//	func (h tunnelHandler) OpenTunnel(stream grpctunnel.TunnelService_OpenTunnelServer) error {
+//	    return grpctunnel.ServeTunnel(stream, h.handlers)
+//	}
 func ServeTunnel(stream TunnelService_OpenTunnelServer, handlers grpchan.HandlerMap) error {
 	return serveTunnel(stream, handlers)
 }
@@ -50,14 +49,13 @@ func ServeTunnel(stream TunnelService_OpenTunnelServer, handlers grpchan.Handler
 // On return the provided stream should be canceled as soon as possible. Typical
 // usage looks like so:
 //
-//    ctx, cancel := context.WithCancel(ctx)
-//    defer cancel()
-//    stream, err := stub.OpenReverseTunnel(ctx)
-//    if err != nil {
-//        return err
-//    }
-//    return grpctunnel.ServeReverseTunnel(stream, handlers)
-//
+//	ctx, cancel := context.WithCancel(ctx)
+//	defer cancel()
+//	stream, err := stub.OpenReverseTunnel(ctx)
+//	if err != nil {
+//	    return err
+//	}
+//	return grpctunnel.ServeReverseTunnel(stream, handlers)
 func ServeReverseTunnel(stream TunnelService_OpenReverseTunnelClient, handlers grpchan.HandlerMap) error {
 	return serveTunnel(stream, handlers)
 }
@@ -370,7 +368,7 @@ func (st *tunnelServerStream) SendMsg(m interface{}) error {
 	}
 
 	if !st.isServerStream && st.numSent == 1 {
-		return status.Errorf(codes.Internal, "Already sent response for non-server-stream method %d", st.method)
+		return status.Errorf(codes.Internal, "Already sent response for non-server-stream method %s", st.method)
 	}
 	st.numSent++
 
@@ -447,7 +445,7 @@ func (st *tunnelServerStream) readMsg() (data []byte, err error, ok bool) {
 		// and fail RPC if so (due to bad input)
 		_, err, ok := st.readMsgLocked()
 		if err == nil {
-			err = status.Errorf(codes.InvalidArgument, "Already received request for non-client-stream method %d", st.method)
+			err = status.Errorf(codes.InvalidArgument, "Already received request for non-client-stream method %s", st.method)
 			st.readErr = err
 			return nil, err, false
 		}
