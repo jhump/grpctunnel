@@ -87,6 +87,10 @@ func (s *tunnelServer) serve() error {
 }
 
 func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *tunnelpb.NewStream) (error, bool) {
+	if s.isClosing() {
+		return status.Errorf(codes.Unavailable, "server is shutting down"), true
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -120,10 +124,6 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 	if md == nil {
 		return status.Errorf(codes.Unimplemented, "%s not implemented", frame.MethodName), true
 	}
-	if s.isClosing() {
-		return status.Errorf(codes.Unavailable, "server is shutting down"), true
-	}
-
 	ctx = metadata.NewIncomingContext(ctx, fromProto(frame.RequestHeaders))
 
 	ch := make(chan tunnelpb.IsClientToServer_Frame, 1)

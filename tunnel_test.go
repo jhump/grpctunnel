@@ -20,16 +20,16 @@ func TestTunnelServer(t *testing.T) {
 	var svr grpchantesting.TestServer
 
 	ready := make(chan struct{})
-	ts := TunnelServiceHandler{
-		OnReverseTunnelConnect: func(*ReverseTunnelChannel) {
+	ts := NewTunnelServiceHandler(TunnelServiceHandlerOptions{
+		OnReverseTunnelConnect: func(ReverseTunnelChannel) {
 			// don't block; just make sure there's something in the channel
 			select {
 			case ready <- struct{}{}:
 			default:
 			}
 		},
-	}
-	grpchantesting.RegisterTestServiceServer(&ts, &svr)
+	})
+	grpchantesting.RegisterTestServiceServer(ts, &svr)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

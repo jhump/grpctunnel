@@ -22,22 +22,14 @@ import (
 // For reverse tunnels, if supported, all connected channels (e.g. all clients
 // that have created reverse tunnels) are available. You can also configure a
 // listener to receive notices when channels are connected and disconnected.
+//
+// See NewTunnelServiceHandler.
 type TunnelServiceHandler struct {
-	// If set, reverse tunnels will not be allowed. The server will reply to
-	// OpenReverseTunnel requests with an "Unimplemented" error code.
-	NoReverseTunnels bool
-	// If reverse tunnels are allowed, this callback may be configured to
-	// receive information when clients open a reverse tunnel.
-	OnReverseTunnelConnect func(*ReverseTunnelChannel)
-	// If reverse tunnels are allowed, this callback may be configured to
-	// receive information when reverse tunnels are torn down.
-	OnReverseTunnelDisconnect func(*ReverseTunnelChannel)
-	// Optional function that accepts a reverse tunnel and returns an affinity
-	// key. The affinity key values can be used to look up outbound channels,
-	// for targeting calls to particular clients or groups of clients.
-	AffinityKey func(*ReverseTunnelChannel) any
-
-	handlers grpchan.HandlerMap
+	handlers                  grpchan.HandlerMap
+	noReverseTunnels          bool
+	onReverseTunnelConnect    func(ReverseTunnelChannel)
+	onReverseTunnelDisconnect func(ReverseTunnelChannel)
+	affinityKey               func(ReverseTunnelChannel) any
 
 	stopping atomic.Bool
 	reverse  reverseChannels
@@ -46,17 +38,52 @@ type TunnelServiceHandler struct {
 	reverseByKey map[interface{}]*reverseChannels
 }
 
+// TunnelServiceHandlerOptions contains various fields that can be used to
+// customize a TunnelServiceHandler.
+//
+// See NewTunnelServiceHandler.
+type TunnelServiceHandlerOptions struct {
+	// If set, reverse tunnels will not be allowed. The server will reply to
+	// OpenReverseTunnel requests with an "Unimplemented" error code.
+	NoReverseTunnels bool
+	// If reverse tunnels are allowed, this callback may be configured to
+	// receive information when clients open a reverse tunnel.
+	OnReverseTunnelConnect func(ReverseTunnelChannel)
+	// If reverse tunnels are allowed, this callback may be configured to
+	// receive information when reverse tunnels are torn down.
+	OnReverseTunnelDisconnect func(ReverseTunnelChannel)
+	// Optional function that accepts a reverse tunnel and returns an affinity
+	// key. The affinity key values can be used to look up outbound channels,
+	// for targeting calls to particular clients or groups of clients.
+	AffinityKey func(ReverseTunnelChannel) any
+}
+
+// NewTunnelServiceHandler creates a new TunnelServiceHandler. The options are
+// used to configure behavior for reverse tunnels. The returned handler is also
+// a [grpc.ServiceRegistrar], to register the services that will be available
+// for forward tunnels.
+//
+// The handler's Service method can be used to actually register the handler
+// with a *grpc.Server.
+func NewTunnelServiceHandler(options TunnelServiceHandlerOptions) *TunnelServiceHandler {
+	return &TunnelServiceHandler{
+		handlers:                  grpchan.HandlerMap{},
+		noReverseTunnels:          options.NoReverseTunnels,
+		onReverseTunnelConnect:    options.OnReverseTunnelConnect,
+		onReverseTunnelDisconnect: options.OnReverseTunnelDisconnect,
+		affinityKey:               options.AffinityKey,
+		reverseByKey:              map[interface{}]*reverseChannels{},
+	}
+}
+
 var _ grpc.ServiceRegistrar = (*TunnelServiceHandler)(nil)
 
 func (s *TunnelServiceHandler) RegisterService(desc *grpc.ServiceDesc, srv interface{}) {
-	if s.handlers == nil {
-		s.handlers = grpchan.HandlerMap{}
-	}
 	s.handlers.RegisterService(desc, srv)
 }
 
 // Service returns the actual tunnel service implementation to register with a
-// *grpc.Server.
+// [grpc.ServiceRegistrar].
 func (s *TunnelServiceHandler) Service() tunnelpb.TunnelServiceServer {
 	return &tunnelServiceHandler{
 		h: s,
@@ -64,7 +91,7 @@ func (s *TunnelServiceHandler) Service() tunnelpb.TunnelServiceServer {
 }
 
 // InitiateShutdown starts the graceful shutdown process and returns
-// immediately. This should be called when the server wants to shutdown. This
+// immediately. This should be called when the server wants to shut down. This
 // complements the normal process initiated by calling the GracefulStop method
 // of a *grpc.Server. It prevents new operations from being initiated on any
 // existing tunnel (while the main server's GracefulStop method prevents new
@@ -83,16 +110,16 @@ func (s *TunnelServiceHandler) openTunnel(stream tunnelpb.TunnelService_OpenTunn
 }
 
 func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_OpenReverseTunnelServer) error {
-	if s.NoReverseTunnels {
+	if s.noReverseTunnels {
 		return status.Error(codes.Unimplemented, "reverse tunnels not supported")
 	}
 
-	ch := NewReverseChannel(stream)
+	ch := newReverseChannel(stream)
 	defer ch.Close()
 
 	var key interface{}
-	if s.AffinityKey != nil {
-		key = s.AffinityKey(ch)
+	if s.affinityKey != nil {
+		key = s.affinityKey(ch)
 	}
 
 	s.reverse.add(ch)
@@ -105,9 +132,6 @@ func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_O
 		rc := s.reverseByKey[key]
 		if rc == nil {
 			rc = &reverseChannels{}
-			if s.reverseByKey == nil {
-				s.reverseByKey = map[interface{}]*reverseChannels{}
-			}
 			s.reverseByKey[key] = rc
 		}
 		return rc
@@ -115,11 +139,11 @@ func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_O
 	rc.add(ch)
 	defer rc.remove(ch)
 
-	if s.OnReverseTunnelConnect != nil {
-		s.OnReverseTunnelConnect(ch)
+	if s.onReverseTunnelConnect != nil {
+		s.onReverseTunnelConnect(ch)
 	}
-	if s.OnReverseTunnelDisconnect != nil {
-		defer s.OnReverseTunnelDisconnect(ch)
+	if s.onReverseTunnelDisconnect != nil {
+		defer s.onReverseTunnelDisconnect(ch)
 	}
 
 	<-ch.Done()
@@ -141,16 +165,18 @@ func (s *tunnelServiceHandler) OpenReverseTunnel(stream tunnelpb.TunnelService_O
 
 type reverseChannels struct {
 	mu    sync.Mutex
-	chans []*ReverseTunnelChannel
+	chans []*reverseTunnelChannel
 	idx   int
 }
 
-func (c *reverseChannels) allChans() []*ReverseTunnelChannel {
+func (c *reverseChannels) allChans() []ReverseTunnelChannel {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	cp := make([]*ReverseTunnelChannel, len(c.chans))
-	copy(cp, c.chans)
+	cp := make([]ReverseTunnelChannel, len(c.chans))
+	for i := range c.chans {
+		cp[i] = c.chans[i]
+	}
 	return cp
 }
 
@@ -172,14 +198,14 @@ func (c *reverseChannels) pick() grpc.ClientConnInterface {
 	return c.chans[c.idx]
 }
 
-func (c *reverseChannels) add(ch *ReverseTunnelChannel) {
+func (c *reverseChannels) add(ch *reverseTunnelChannel) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.chans = append(c.chans, ch)
 }
 
-func (c *reverseChannels) remove(ch *ReverseTunnelChannel) {
+func (c *reverseChannels) remove(ch *reverseTunnelChannel) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -191,38 +217,45 @@ func (c *reverseChannels) remove(ch *ReverseTunnelChannel) {
 	}
 }
 
-func (s *TunnelServiceHandler) AllReverseTunnels() []*ReverseTunnelChannel {
+// AllReverseTunnels returns the set of all currently active reverse tunnels.
+func (s *TunnelServiceHandler) AllReverseTunnels() []ReverseTunnelChannel {
 	return s.reverse.allChans()
 }
 
+// AsChannel returns a channel that can be used for issuing RPCs back to clients
+// over reverse tunnels. If no reverse tunnels are established, RPCs will fail
+// with "Unavailable" errors.
+//
+// The returned channel will use a round-robin strategy to select from available
+// reverse tunnels for any given RPC.
+//
+// This method panics if the handler was created with an option to disallow the
+// use of reverse tunnels.
 func (s *TunnelServiceHandler) AsChannel() grpc.ClientConnInterface {
-	if s.NoReverseTunnels {
+	if s.noReverseTunnels {
 		panic("reverse tunnels not supported")
 	}
 	return multiChannel(s.reverse.pick)
 }
 
+// KeyAsChannel returns a channel that can be used for issuing RPCs back to
+// clients over reverse tunnels whose affinity key matches the given value.
+// If no reverse tunnels that match are established, RPCs will fail with
+// "Unavailable" errors. If no affinity key function was provided when the
+// handler was created, the only key available will be the nil interface.
+//
+// The returned channel will use a round-robin strategy to select from matching
+// reverse tunnels for any given RPC.
+//
+// This method panics if the handler was created with an option to disallow the
+// use of reverse tunnels.
 func (s *TunnelServiceHandler) KeyAsChannel(key interface{}) grpc.ClientConnInterface {
-	if s.NoReverseTunnels {
+	if s.noReverseTunnels {
 		panic("reverse tunnels not supported")
 	}
 	return multiChannel(func() grpc.ClientConnInterface {
 		return s.pickKey(key)
 	})
-}
-
-func (s *TunnelServiceHandler) FindChannel(search func(*ReverseTunnelChannel) bool) *ReverseTunnelChannel {
-	if s.NoReverseTunnels {
-		panic("reverse tunnels not supported")
-	}
-	allChans := s.reverse.allChans()
-
-	for _, ch := range allChans {
-		if !ch.IsDone() && search(ch) {
-			return ch
-		}
-	}
-	return nil
 }
 
 func (s *TunnelServiceHandler) pickKey(key interface{}) grpc.ClientConnInterface {
