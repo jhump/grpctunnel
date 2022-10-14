@@ -8,18 +8,20 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/jhump/grpctunnel/tunnelpb"
 )
 
-// TunnelServer provides an implementation for grpctunnel.TunnelServiceServer.
-// You can register handlers with it, and it will then expose those handlers
-// for incoming tunnels. If no handlers are registered, the server will reply
-// to OpenTunnel requests with an "Unimplemented" error code. The server may
-// still be used for reverse tunnels
+// TunnelServiceHandler provides an implementation for TunnelServiceServer. You
+// can register handlers with it, and it will then expose those handlers for
+// incoming tunnels. If no handlers are registered, the server will reply to
+// OpenTunnel requests with an "Unimplemented" error code. The server may still
+// be used for reverse tunnels
 //
 // For reverse tunnels, if supported, all connected channels (e.g. all clients
 // that have created reverse tunnels) are available. You can also configure a
 // listener to receive notices when channels are connected and disconnected.
-type TunnelServer struct {
+type TunnelServiceHandler struct {
 	// If set, reverse tunnels will not be allowed. The server will reply to
 	// OpenReverseTunnel requests with an "Unimplemented" error code.
 	NoReverseTunnels bool
@@ -42,17 +44,17 @@ type TunnelServer struct {
 	reverseByKey map[interface{}]*reverseChannels
 }
 
-var _ TunnelServiceServer = (*TunnelServer)(nil)
-var _ grpchan.ServiceRegistry = (*TunnelServer)(nil)
+var _ tunnelpb.TunnelServiceServer = (*TunnelServiceHandler)(nil)
+var _ grpc.ServiceRegistrar = (*TunnelServiceHandler)(nil)
 
-func (s *TunnelServer) RegisterService(desc *grpc.ServiceDesc, srv interface{}) {
+func (s *TunnelServiceHandler) RegisterService(desc *grpc.ServiceDesc, srv interface{}) {
 	if s.handlers == nil {
 		s.handlers = grpchan.HandlerMap{}
 	}
 	s.handlers.RegisterService(desc, srv)
 }
 
-func (s *TunnelServer) OpenTunnel(stream TunnelService_OpenTunnelServer) error {
+func (s *TunnelServiceHandler) OpenTunnel(stream tunnelpb.TunnelService_OpenTunnelServer) error {
 	if len(s.handlers) == 0 {
 		return status.Error(codes.Unimplemented, "forward tunnels not supported")
 	}
@@ -60,7 +62,7 @@ func (s *TunnelServer) OpenTunnel(stream TunnelService_OpenTunnelServer) error {
 	return ServeTunnel(stream, s.handlers)
 }
 
-func (s *TunnelServer) OpenReverseTunnel(stream TunnelService_OpenReverseTunnelServer) error {
+func (s *TunnelServiceHandler) OpenReverseTunnel(stream tunnelpb.TunnelService_OpenReverseTunnelServer) error {
 	if s.NoReverseTunnels {
 		return status.Error(codes.Unimplemented, "reverse tunnels not supported")
 	}
@@ -119,7 +121,7 @@ func (c *reverseChannels) allChans() []*ReverseTunnelChannel {
 	return cp
 }
 
-func (c *reverseChannels) pick() grpchan.Channel {
+func (c *reverseChannels) pick() grpc.ClientConnInterface {
 	if c == nil {
 		return nil
 	}
@@ -156,27 +158,27 @@ func (c *reverseChannels) remove(ch *ReverseTunnelChannel) {
 	}
 }
 
-func (s *TunnelServer) AllReverseTunnels() []*ReverseTunnelChannel {
+func (s *TunnelServiceHandler) AllReverseTunnels() []*ReverseTunnelChannel {
 	return s.reverse.allChans()
 }
 
-func (s *TunnelServer) AsChannel() grpchan.Channel {
+func (s *TunnelServiceHandler) AsChannel() grpc.ClientConnInterface {
 	if s.NoReverseTunnels {
 		panic("reverse tunnels not supported")
 	}
 	return multiChannel(s.reverse.pick)
 }
 
-func (s *TunnelServer) KeyAsChannel(key interface{}) grpchan.Channel {
+func (s *TunnelServiceHandler) KeyAsChannel(key interface{}) grpc.ClientConnInterface {
 	if s.NoReverseTunnels {
 		panic("reverse tunnels not supported")
 	}
-	return multiChannel(func() grpchan.Channel {
+	return multiChannel(func() grpc.ClientConnInterface {
 		return s.pickKey(key)
 	})
 }
 
-func (s *TunnelServer) FindChannel(search func(*ReverseTunnelChannel) bool) *ReverseTunnelChannel {
+func (s *TunnelServiceHandler) FindChannel(search func(*ReverseTunnelChannel) bool) *ReverseTunnelChannel {
 	if s.NoReverseTunnels {
 		panic("reverse tunnels not supported")
 	}
@@ -190,14 +192,14 @@ func (s *TunnelServer) FindChannel(search func(*ReverseTunnelChannel) bool) *Rev
 	return nil
 }
 
-func (s *TunnelServer) pickKey(key interface{}) grpchan.Channel {
+func (s *TunnelServiceHandler) pickKey(key interface{}) grpc.ClientConnInterface {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	return s.reverseByKey[key].pick()
 }
 
-type multiChannel func() grpchan.Channel
+type multiChannel func() grpc.ClientConnInterface
 
 func (c multiChannel) Invoke(ctx context.Context, methodName string, req, resp interface{}, opts ...grpc.CallOption) error {
 	ch := c()

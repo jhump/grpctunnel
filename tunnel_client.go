@@ -14,13 +14,15 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+
+	"github.com/jhump/grpctunnel/tunnelpb"
 )
 
-func NewChannel(stream TunnelService_OpenTunnelClient) *TunnelChannel {
+func NewChannel(stream tunnelpb.TunnelService_OpenTunnelClient) *TunnelChannel {
 	return newTunnelChannel(stream, stream.CloseSend)
 }
 
-func NewReverseChannel(stream TunnelService_OpenReverseTunnelServer) *ReverseTunnelChannel {
+func NewReverseChannel(stream tunnelpb.TunnelService_OpenReverseTunnelServer) *ReverseTunnelChannel {
 	p, _ := peer.FromContext(stream.Context())
 	md, _ := metadata.FromIncomingContext(stream.Context())
 	ch := newTunnelChannel(stream, nil)
@@ -39,8 +41,8 @@ type ReverseTunnelChannel struct {
 
 type tunnelStreamClient interface {
 	Context() context.Context
-	Send(*ClientToServer) error
-	Recv() (*ServerToClient, error)
+	Send(*tunnelpb.ClientToServer) error
+	Recv() (*tunnelpb.ServerToClient, error)
 }
 
 type TunnelChannel struct {
@@ -127,10 +129,10 @@ func (c *TunnelChannel) newStream(ctx context.Context, clientStreams, serverStre
 	if err != nil {
 		return nil, err
 	}
-	err = c.stream.Send(&ClientToServer{
+	err = c.stream.Send(&tunnelpb.ClientToServer{
 		StreamId: str.streamID,
-		Frame: &ClientToServer_NewStream{
-			NewStream: &NewStream{
+		Frame: &tunnelpb.ClientToServer_NewStream{
+			NewStream: &tunnelpb.NewStream{
 				MethodName:     methodName,
 				RequestHeaders: toProto(md),
 			},
@@ -212,7 +214,7 @@ func (c *TunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 		}
 	}
 
-	ch := make(chan isServerToClient_Frame, 1)
+	ch := make(chan tunnelpb.IsServerToClient_Frame, 1)
 	ctx, cncl := context.WithCancel(ctx)
 	str := &tunnelClientStream{
 		ctx:              ctx,
@@ -318,7 +320,7 @@ type tunnelClientStream struct {
 
 	// for "ingesting" frames into channel, from receive loop
 	ingestMu         sync.Mutex
-	ingestChan       chan<- isServerToClient_Frame
+	ingestChan       chan<- tunnelpb.IsServerToClient_Frame
 	gotHeaders       bool
 	gotHeadersSignal chan struct{}
 	headers          metadata.MD
@@ -328,7 +330,7 @@ type tunnelClientStream struct {
 
 	// for reading frames from channel, to read message data
 	readMu   sync.Mutex
-	readChan <-chan isServerToClient_Frame
+	readChan <-chan tunnelpb.IsServerToClient_Frame
 	readErr  error
 
 	// for sending frames to server
@@ -385,9 +387,9 @@ func (st *tunnelClientStream) CloseSend() error {
 		return errors.New("already half-closed")
 	}
 	st.halfClosed = true
-	return st.stream.Send(&ClientToServer{
+	return st.stream.Send(&tunnelpb.ClientToServer{
 		StreamId: st.streamID,
-		Frame: &ClientToServer_HalfClose{
+		Frame: &tunnelpb.ClientToServer_HalfClose{
 			HalfClose: &empty.Empty{},
 		},
 	})
@@ -424,19 +426,19 @@ func (st *tunnelClientStream) SendMsg(m interface{}) error {
 		}
 
 		if i == 0 {
-			err = st.stream.Send(&ClientToServer{
+			err = st.stream.Send(&tunnelpb.ClientToServer{
 				StreamId: st.streamID,
-				Frame: &ClientToServer_RequestMessage{
-					RequestMessage: &MessageData{
+				Frame: &tunnelpb.ClientToServer_RequestMessage{
+					RequestMessage: &tunnelpb.MessageData{
 						Size: int32(len(b)),
 						Data: chunk,
 					},
 				},
 			})
 		} else {
-			err = st.stream.Send(&ClientToServer{
+			err = st.stream.Send(&tunnelpb.ClientToServer{
 				StreamId: st.streamID,
-				Frame: &ClientToServer_MoreRequestData{
+				Frame: &tunnelpb.ClientToServer_MoreRequestData{
 					MoreRequestData: chunk,
 				},
 			})
@@ -513,7 +515,7 @@ func (st *tunnelClientStream) readMsgLocked() (data []byte, err error, ok bool) 
 		}
 
 		switch in := in.(type) {
-		case *ServerToClient_ResponseMessage:
+		case *tunnelpb.ServerToClient_ResponseMessage:
 			if msgLen != -1 {
 				return nil, status.Errorf(codes.Internal, "server sent redundant response message envelope"), false
 			}
@@ -526,7 +528,7 @@ func (st *tunnelClientStream) readMsgLocked() (data []byte, err error, ok bool) 
 				return b, nil, true
 			}
 
-		case *ServerToClient_MoreResponseData:
+		case *tunnelpb.ServerToClient_MoreResponseData:
 			if msgLen == -1 {
 				return nil, status.Errorf(codes.Internal, "server never sent envelope for response message"), false
 			}
@@ -553,7 +555,7 @@ func (st *tunnelClientStream) err() error {
 	}
 }
 
-func (st *tunnelClientStream) acceptServerFrame(frame isServerToClient_Frame) {
+func (st *tunnelClientStream) acceptServerFrame(frame tunnelpb.IsServerToClient_Frame) {
 	if st == nil {
 		// can happen if client decided that the stream ID was recently used
 		// yet inactive -- it returns nil error but also nil stream, which
@@ -563,7 +565,7 @@ func (st *tunnelClientStream) acceptServerFrame(frame isServerToClient_Frame) {
 	}
 
 	switch frame := frame.(type) {
-	case *ServerToClient_ResponseHeaders:
+	case *tunnelpb.ServerToClient_ResponseHeaders:
 		st.ingestMu.Lock()
 		defer st.ingestMu.Unlock()
 		if st.gotHeaders {
@@ -578,7 +580,7 @@ func (st *tunnelClientStream) acceptServerFrame(frame isServerToClient_Frame) {
 		close(st.gotHeadersSignal)
 		return
 
-	case *ServerToClient_CloseStream:
+	case *tunnelpb.ServerToClient_CloseStream:
 		trailers := fromProto(frame.CloseStream.ResponseTrailers)
 		err := status.FromProto(frame.CloseStream.Status).Err()
 		st.finishStream(err, trailers)
@@ -602,9 +604,9 @@ func (st *tunnelClientStream) cancel(err error) {
 	// let server know
 	st.writeMu.Lock()
 	defer st.writeMu.Unlock()
-	_ = st.stream.Send(&ClientToServer{
+	_ = st.stream.Send(&tunnelpb.ClientToServer{
 		StreamId: st.streamID,
-		Frame: &ClientToServer_Cancel{
+		Frame: &tunnelpb.ClientToServer_Cancel{
 			Cancel: &empty.Empty{},
 		},
 	})

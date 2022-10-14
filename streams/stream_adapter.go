@@ -1,4 +1,4 @@
-package grpctunnel
+package streams
 
 import (
 	"context"
@@ -59,7 +59,7 @@ type response struct {
 // send requests and then expects responses in reply. (This does not necessarily
 // have to be a gRPC client though, as a stream could allow servers to initiate
 // requests this way). For the server side of the stream, see HandleServerStream.
-func NewStreamAdapter(stream grpc.Stream, requestKeyExtractor, responseKeyExtractor func(interface{}) interface{}, responseFactory func() interface{}) *StreamAdapter {
+func NewStreamAdapter(stream Stream, requestKeyExtractor, responseKeyExtractor func(interface{}) interface{}, responseFactory func() interface{}) *StreamAdapter {
 	if (requestKeyExtractor == nil) == (responseKeyExtractor == nil) {
 		panic("if requestKeyExtractor and responseKeyExtractor must either both nil or both be non-nil")
 	}
@@ -81,7 +81,7 @@ func NewStreamAdapter(stream grpc.Stream, requestKeyExtractor, responseKeyExtrac
 
 var typeOfError = reflect.TypeOf((*error)(nil)).Elem()
 
-func createFactory(stream grpc.Stream) func() interface{} {
+func createFactory(stream Stream) func() interface{} {
 	t := reflect.TypeOf(stream)
 	mtd, ok := t.MethodByName("Recv")
 	if !ok {
@@ -104,12 +104,23 @@ func createFactory(stream grpc.Stream) func() interface{} {
 	}
 }
 
-// StreamAdapter wraps a grpc.Stream and implements a simple request-response
+// Stream is the common interface shared by both grpc.ServerStream and
+// grpc.ClientStream. This package allows full-duplex bidi streams to be used in
+// either direction -- so servers can initiate operations by sending a message
+// to the client, in addition to the more typical direction where clients
+// initiate operations.
+type Stream interface {
+	Context() context.Context
+	SendMsg(m interface{}) error
+	RecvMsg(m interface{}) error
+}
+
+// StreamAdapter wraps a gRPC stream and implements a simple request-response
 // mechanism on top of it.
 type StreamAdapter struct {
 	ctx                  context.Context
 	cancel               context.CancelFunc
-	stream               grpc.Stream
+	stream               Stream
 	responseFactory      func() interface{}
 	requestKeyExtractor  func(interface{}) interface{}
 	responseKeyExtractor func(interface{}) interface{}
@@ -203,6 +214,7 @@ func (a *StreamAdapter) removePending(key interface{}, ch chan<- response) bool 
 	return false
 }
 
+// Context returns the context associate with this stream.
 func (a *StreamAdapter) Context() context.Context {
 	return a.ctx
 }
@@ -249,7 +261,7 @@ func (a *StreamAdapter) replyToPending(resp, key interface{}, count uint64) bool
 	} else {
 		// no pending request that corresponds to the received response?
 		if cs, ok := a.stream.(grpc.ClientStream); ok {
-			cs.CloseSend()
+			_ = cs.CloseSend()
 		}
 		a.cancel()
 
@@ -308,7 +320,7 @@ var typeOfContext = reflect.TypeOf((*context.Context)(nil)).Elem()
 // have to be a gRPC server though, as a stream could allow clients to accept
 // and process requests this way). For the client side of the stream, see
 // NewStreamAdapter.
-func HandleServerStream(stream grpc.Stream, serveFunc interface{}, requestKeyExtractor func(interface{}) interface{}, requestFactory func() interface{}) error {
+func HandleServerStream(stream Stream, serveFunc interface{}, requestKeyExtractor func(interface{}) interface{}, requestFactory func() interface{}) error {
 	t := reflect.TypeOf(serveFunc)
 	if t.Kind() != reflect.Func {
 		panic("serveFunc must be a function")
@@ -368,7 +380,7 @@ func HandleServerStream(stream grpc.Stream, serveFunc interface{}, requestKeyExt
 }
 
 type workers struct {
-	stream              grpc.Stream
+	stream              Stream
 	action              func(context.Context, interface{}) interface{}
 	requestKeyExtractor func(interface{}) interface{}
 	ctx                 context.Context
