@@ -36,7 +36,7 @@ func TestTunnelServer(t *testing.T) {
 		t.Fatalf("failed to listen: %v", err)
 	}
 	gs := grpc.NewServer()
-	tunnelpb.RegisterTunnelServiceServer(gs, &ts)
+	tunnelpb.RegisterTunnelServiceServer(gs, ts.Service())
 	go func() {
 		if err := gs.Serve(l); err != nil {
 			t.Logf("error from grpc server: %v", err)

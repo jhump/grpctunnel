@@ -44,7 +44,6 @@ type TunnelServiceHandler struct {
 	reverseByKey map[interface{}]*reverseChannels
 }
 
-var _ tunnelpb.TunnelServiceServer = (*TunnelServiceHandler)(nil)
 var _ grpc.ServiceRegistrar = (*TunnelServiceHandler)(nil)
 
 func (s *TunnelServiceHandler) RegisterService(desc *grpc.ServiceDesc, srv interface{}) {
@@ -54,7 +53,13 @@ func (s *TunnelServiceHandler) RegisterService(desc *grpc.ServiceDesc, srv inter
 	s.handlers.RegisterService(desc, srv)
 }
 
-func (s *TunnelServiceHandler) OpenTunnel(stream tunnelpb.TunnelService_OpenTunnelServer) error {
+func (s *TunnelServiceHandler) Service() tunnelpb.TunnelServiceServer {
+	return &tunnelServiceHandler{
+		h: s,
+	}
+}
+
+func (s *TunnelServiceHandler) openTunnel(stream tunnelpb.TunnelService_OpenTunnelServer) error {
 	if len(s.handlers) == 0 {
 		return status.Error(codes.Unimplemented, "forward tunnels not supported")
 	}
@@ -62,7 +67,7 @@ func (s *TunnelServiceHandler) OpenTunnel(stream tunnelpb.TunnelService_OpenTunn
 	return ServeTunnel(stream, s.handlers)
 }
 
-func (s *TunnelServiceHandler) OpenReverseTunnel(stream tunnelpb.TunnelService_OpenReverseTunnelServer) error {
+func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_OpenReverseTunnelServer) error {
 	if s.NoReverseTunnels {
 		return status.Error(codes.Unimplemented, "reverse tunnels not supported")
 	}
@@ -104,6 +109,19 @@ func (s *TunnelServiceHandler) OpenReverseTunnel(stream tunnelpb.TunnelService_O
 
 	<-ch.Done()
 	return ch.Err()
+}
+
+type tunnelServiceHandler struct {
+	tunnelpb.UnimplementedTunnelServiceServer
+	h *TunnelServiceHandler
+}
+
+func (s *tunnelServiceHandler) OpenTunnel(stream tunnelpb.TunnelService_OpenTunnelServer) error {
+	return s.h.openTunnel(stream)
+}
+
+func (s *tunnelServiceHandler) OpenReverseTunnel(stream tunnelpb.TunnelService_OpenReverseTunnelServer) error {
+	return s.h.openReverseTunnel(stream)
 }
 
 type reverseChannels struct {
