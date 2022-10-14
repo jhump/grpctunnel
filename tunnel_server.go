@@ -20,142 +20,13 @@ import (
 
 const maxChunkSize = 16384
 
-// ServeTunnel uses the given services to handle incoming RPC requests that
-// arrive via the given incoming tunnel stream.
-//
-// It returns if, in the process of reading requests, it detects invalid usage
-// of the stream (client sending references to invalid stream IDs or sending
-// frames for a stream ID in improper order) or if the stream itself fails (for
-// example, if the client cancels the tunnel or there is a network disruption).
-//
-// This is typically called from a handler that implements the TunnelService.
-// Typical usage looks like so:
-//
-//	func (h tunnelHandler) OpenTunnel(stream grpctunnel.TunnelService_OpenTunnelServer) error {
-//	    return grpctunnel.ServeTunnel(stream, h.handlers)
-//	}
-func ServeTunnel(stream tunnelpb.TunnelService_OpenTunnelServer, handlers grpchan.HandlerMap) error {
-	return serveTunnel(stream, handlers)
-}
-
-// ServeReverseTunnel uses the given handlers to service incoming RPC requests
-// that arrive via the given client tunnel stream. Since this is a reverse
-// tunnel, RPC requests are initiated by the server, and this end (the client)
-// processes the requests and sends responses.
-//
-// The server stops if, in the process of reading requests, it detects invalid
-// usage of the stream (client sending references to invalid stream IDs or
-// sending frames for a stream ID in improper order) or if the stream itself
-// fails (for example, if the client cancels the tunnel or there is a network
-// disruption).
-//
-// When the server is done, the provided stream should be canceled as soon as
-// possible. Typical usage looks like so:
-//
-//	ctx, cancel := context.WithCancel(ctx)
-//	defer cancel()
-//	stream, err := stub.OpenReverseTunnel(ctx)
-//	if err != nil {
-//	    return err
-//	}
-//	svr := grpctunnel.ServeReverseTunnel(stream, handlers)
-//	return svr.Await()
-//
-// Callers should avoid using the CloseSend method on the given stream. This
-// could result in internal errors where the server is trying to send messages
-// on a closed stream. To stop the sever, instead use the Shutdown method of the
-// returned server. That will half-close the given stream and stop the server's
-// activity in a safe way.
-func ServeReverseTunnel(stream tunnelpb.TunnelService_OpenReverseTunnelClient, handlers grpchan.HandlerMap) ReverseTunnelServer {
-	safeStream := &halfCloseSafeReverseTunnel{TunnelService_OpenReverseTunnelClient: stream}
-	done := make(chan struct{})
-	svr := &reverseTunnelServer{stream: safeStream, done: done}
-	go func() {
-		defer close(done)
-		err := serveTunnel(safeStream, handlers)
-		if err == context.Canceled && stream.Context().Err() == nil && safeStream.isClosed() {
-			// If the incoming stream context is not canceled, but serveTunnel's context
-			// was cancelled due to closing the stream, we don't report that as an error
-			// as that is "normal" shutdown operation.
-			err = nil
-		}
-		svr.err = err
-	}()
-	return svr
-}
-
-// ReverseTunnelServer represents a server that is running on the client side of
-// a gRPC connection, handling requests sent over a reverse tunnel.
-type ReverseTunnelServer interface {
-	// Await the server to finish. If the server stops normally due to a call
-	// to the Shutdown method, this returns nil. Otherwise, it will return the
-	// cause of the server stopping.
-	//
-	// If the given context is cancelled or times out before the server is
-	// done, this returns prematurely with a context error.
-	Await(context.Context) error
-	// Shutdown stops the server, which immediately cancels any outstanding
-	// operations.
-	Shutdown()
-}
-
-type reverseTunnelServer struct {
-	stream *halfCloseSafeReverseTunnel
-	done   chan struct{}
-	err    error
-}
-
-func (r *reverseTunnelServer) Await(ctx context.Context) error {
-	select {
-	case <-r.done:
-		return r.err
-	case <-ctx.Done():
-		return r.stream.Context().Err()
-	}
-}
-
-func (r *reverseTunnelServer) Shutdown() {
-	_ = r.stream.CloseSend()
-}
-
-type halfCloseSafeReverseTunnel struct {
-	tunnelpb.TunnelService_OpenReverseTunnelClient
-	mu     sync.Mutex
-	closed bool
-}
-
-func (h *halfCloseSafeReverseTunnel) isClosed() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.closed
-}
-
-func (h *halfCloseSafeReverseTunnel) CloseSend() error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.closed = true
-	return h.TunnelService_OpenReverseTunnelClient.CloseSend()
-}
-
-func (h *halfCloseSafeReverseTunnel) Send(msg *tunnelpb.ServerToClient) error {
-	return h.SendMsg(msg)
-}
-
-func (h *halfCloseSafeReverseTunnel) SendMsg(m interface{}) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.closed {
-		return io.EOF
-	}
-	return h.TunnelService_OpenReverseTunnelClient.SendMsg(m)
-}
-
-func serveTunnel(stream tunnelStreamServer, handlers grpchan.HandlerMap) error {
+func serveTunnel(stream tunnelStreamServer, handlers grpchan.HandlerMap, isClosing func() bool) error {
 	svr := &tunnelServer{
-		stream:   stream,
-		services: handlers,
-		streams:  map[int64]*tunnelServerStream{},
-		lastSeen: -1,
+		stream:    stream,
+		services:  handlers,
+		isClosing: isClosing,
+		streams:   map[int64]*tunnelServerStream{},
+		lastSeen:  -1,
 	}
 	return svr.serve()
 }
@@ -167,8 +38,9 @@ type tunnelStreamServer interface {
 }
 
 type tunnelServer struct {
-	stream   tunnelStreamServer
-	services grpchan.HandlerMap
+	stream    tunnelStreamServer
+	services  grpchan.HandlerMap
+	isClosing func() bool
 
 	mu       sync.RWMutex
 	streams  map[int64]*tunnelServerStream

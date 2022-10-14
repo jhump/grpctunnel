@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fullstorydev/grpchan"
 	"github.com/fullstorydev/grpchan/grpchantesting"
-	"github.com/jhump/grpctunnel/tunnelpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/jhump/grpctunnel/tunnelpb"
 )
 
 func TestTunnelServer(t *testing.T) {
@@ -54,6 +54,10 @@ func TestTunnelServer(t *testing.T) {
 
 	cli := tunnelpb.NewTunnelServiceClient(cc)
 
+	// Make sure any goroutines used by the client and server created above have started. That
+	// way, we don't incorrectly think they are leaked goroutines.
+	time.Sleep(500 * time.Millisecond)
+
 	t.Run("forward", func(t *testing.T) {
 		checkForGoroutineLeak(t, func() {
 			tunnel, err := cli.OpenTunnel(context.Background())
@@ -70,21 +74,15 @@ func TestTunnelServer(t *testing.T) {
 
 	t.Run("reverse", func(t *testing.T) {
 		checkForGoroutineLeak(t, func() {
-			tunnel, err := cli.OpenReverseTunnel(context.Background())
-			if err != nil {
-				t.Fatalf("failed to open reverse tunnel: %v", err)
-			}
-
-			// client now acts as the server
-			handlerMap := grpchan.HandlerMap{}
-			grpchantesting.RegisterTestServiceServer(handlerMap, &svr)
-			svr := ServeReverseTunnel(tunnel, handlerMap)
-			defer func() {
-				svr.Shutdown()
-				err := svr.Await(context.Background())
-				if err != nil {
-					t.Errorf("ServeReverseTunnel returned error: %v", err)
+			revSvr := NewReverseTunnelServer(cli)
+			grpchantesting.RegisterTestServiceServer(revSvr, &svr)
+			go func() {
+				if err, _ := revSvr.Serve(context.Background()); err != nil {
+					t.Logf("ReverseTunnelServer.Serve returned error: %v", err)
 				}
+			}()
+			defer func() {
+				revSvr.Stop()
 			}()
 
 			// make sure server has registered client, so we can issue RPCs to it

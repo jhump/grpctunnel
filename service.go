@@ -3,6 +3,7 @@ package grpctunnel
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/fullstorydev/grpchan"
 	"google.golang.org/grpc"
@@ -34,11 +35,12 @@ type TunnelServiceHandler struct {
 	// Optional function that accepts a reverse tunnel and returns an affinity
 	// key. The affinity key values can be used to look up outbound channels,
 	// for targeting calls to particular clients or groups of clients.
-	AffinityKey func(*ReverseTunnelChannel) interface{}
+	AffinityKey func(*ReverseTunnelChannel) any
 
 	handlers grpchan.HandlerMap
 
-	reverse reverseChannels
+	stopping atomic.Bool
+	reverse  reverseChannels
 
 	mu           sync.RWMutex
 	reverseByKey map[interface{}]*reverseChannels
@@ -59,12 +61,16 @@ func (s *TunnelServiceHandler) Service() tunnelpb.TunnelServiceServer {
 	}
 }
 
+func (s *TunnelServiceHandler) InitiateShutdown() {
+	s.stopping.Store(true)
+}
+
 func (s *TunnelServiceHandler) openTunnel(stream tunnelpb.TunnelService_OpenTunnelServer) error {
 	if len(s.handlers) == 0 {
 		return status.Error(codes.Unimplemented, "forward tunnels not supported")
 	}
 
-	return ServeTunnel(stream, s.handlers)
+	return serveTunnel(stream, s.handlers, s.stopping.Load)
 }
 
 func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_OpenReverseTunnelServer) error {
