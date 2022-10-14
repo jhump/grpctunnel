@@ -118,8 +118,10 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 	}
 
 	if md == nil {
-		delete(s.streams, streamID)
 		return status.Errorf(codes.Unimplemented, "%s not implemented", frame.MethodName), true
+	}
+	if s.isClosing() {
+		return status.Errorf(codes.Unavailable, "server is shutting down"), true
 	}
 
 	ctx = metadata.NewIncomingContext(ctx, fromProto(frame.RequestHeaders))

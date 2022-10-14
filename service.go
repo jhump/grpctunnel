@@ -55,12 +55,21 @@ func (s *TunnelServiceHandler) RegisterService(desc *grpc.ServiceDesc, srv inter
 	s.handlers.RegisterService(desc, srv)
 }
 
+// Service returns the actual tunnel service implementation to register with a
+// *grpc.Server.
 func (s *TunnelServiceHandler) Service() tunnelpb.TunnelServiceServer {
 	return &tunnelServiceHandler{
 		h: s,
 	}
 }
 
+// InitiateShutdown starts the graceful shutdown process and returns
+// immediately. This should be called when the server wants to shutdown. This
+// complements the normal process initiated by calling the GracefulStop method
+// of a *grpc.Server. It prevents new operations from being initiated on any
+// existing tunnel (while the main server's GracefulStop method prevents new
+// tunnels from being established). This allows the server to drain, letting
+// existing operations to complete.
 func (s *TunnelServiceHandler) InitiateShutdown() {
 	s.stopping.Store(true)
 }

@@ -95,7 +95,7 @@ func (s *ReverseTunnelServer) addInstance(stream tunnelpb.TunnelService_OpenReve
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state >= stateClosing {
-		return status.Errorf(codes.Unavailable, "no channels ready")
+		return status.Errorf(codes.Unavailable, "server is shutting down")
 	}
 	s.wg.Add(1)
 	if s.instances == nil {
