@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package grpctunnel.testing;
+
+option go_package = "github.com/jhump/grpctunnel/internal/testservices";
+
+service TestService {
+  rpc Foo(testing.Foo) returns (testing.Foo);
+  rpc StreamingFoo(stream testing.Foo) returns (stream testing.Foo);
+}
+
+message Foo {
+  string name = 1;
+  int64 id = 2;
+  bytes data = 3;
+}

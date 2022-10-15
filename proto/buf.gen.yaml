@@ -2,9 +2,7 @@ version: v1
 plugins:
   - name: go
     out: ../
-    opt:
-      - Mgrpctunnel/v1/tunnel.proto=./tunnelpb
+    opt: [Mgrpctunnel/v1/tunnel.proto=./tunnelpb]
   - name: go-grpc
     out: ../
-    opt:
-      - Mgrpctunnel/v1/tunnel.proto=./tunnelpb
+    opt: [Mgrpctunnel/v1/tunnel.proto=./tunnelpb]
