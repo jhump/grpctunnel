@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"reflect"
 	"sync"
 	"sync/atomic"
 
@@ -14,8 +13,8 @@ import (
 // CorruptResponseStreamError is an error that occurs when a correlated stream
 // adapter receives a message that cannot be correlated to a pending request.
 type CorruptResponseStreamError struct {
-	resp  interface{}
-	key   interface{}
+	resp  any
+	key   any
 	count uint64
 }
 
@@ -25,10 +24,12 @@ func (e CorruptResponseStreamError) Error() string {
 }
 
 // response is a tuple that can hold either a response message or an error
-type response struct {
-	resp interface{}
+type response[T any] struct {
+	resp T
 	err  error
 }
+
+type void struct{}
 
 // NewStreamAdapter returns a stream adapter that correlates responses with
 // their corresponding requests via the given key extractor functions. If either
@@ -59,48 +60,34 @@ type response struct {
 // send requests and then expects responses in reply. (This does not necessarily
 // have to be a gRPC client though, as a stream could allow servers to initiate
 // requests this way). For the server side of the stream, see HandleServerStream.
-func NewStreamAdapter(stream Stream, requestKeyExtractor, responseKeyExtractor func(interface{}) interface{}, responseFactory func() interface{}) *StreamAdapter {
-	if (requestKeyExtractor == nil) == (responseKeyExtractor == nil) {
-		panic("if requestKeyExtractor and responseKeyExtractor must either both nil or both be non-nil")
+func NewStreamAdapter[Req any, Resp any](stream Stream[Req, Resp]) StreamAdapter[Req, Resp] {
+	return NewStreamAdapterWithCorrelationKey[Req, Resp, void](
+		stream,
+		func(Req) void { return void{} },
+		func(Resp) void { return void{} },
+	)
+}
+
+func NewStreamAdapterWithCorrelationKey[Req any, Resp any, K comparable](
+	stream Stream[Req, Resp],
+	requestKeyExtractor func(Req) K,
+	responseKeyExtractor func(Resp) K,
+) StreamAdapter[Req, Resp] {
+	if requestKeyExtractor == nil {
+		panic("cannot correlate keys with nil requestKeyExtractor")
 	}
-	if responseFactory == nil {
-		responseFactory = createFactory(stream)
+	if responseKeyExtractor == nil {
+		panic("cannot correlate keys with nil responseKeyExtractor")
 	}
 
 	ctx, cancel := context.WithCancel(stream.Context())
-	return &StreamAdapter{
+	return &streamAdapter[Req, Resp, K]{
 		ctx:                  ctx,
 		cancel:               cancel,
 		stream:               stream,
 		requestKeyExtractor:  requestKeyExtractor,
 		responseKeyExtractor: responseKeyExtractor,
-		responseFactory:      responseFactory,
-		pending:              map[interface{}][]chan<- response{},
-	}
-}
-
-var typeOfError = reflect.TypeOf((*error)(nil)).Elem()
-
-func createFactory(stream Stream) func() interface{} {
-	t := reflect.TypeOf(stream)
-	mtd, ok := t.MethodByName("Recv")
-	if !ok {
-		panic("stream has no Recv method from which type can be inferred")
-	}
-	mt := mtd.Type
-	if mt.NumIn() != 1 || mt.In(0) != t {
-		panic(fmt.Sprintf("stream's Recv method has wrong signature: %v", mt))
-	}
-	if mt.NumOut() != 2 || mt.Out(1) != typeOfError {
-		panic(fmt.Sprintf("stream's Recv method has wrong signature: %v", mt))
-	}
-	respType := mt.Out(0)
-	if respType.Kind() != reflect.Ptr {
-		panic(fmt.Sprintf("stream's Recv method has wrong signature: %v", mt))
-	}
-
-	return func() interface{} {
-		return reflect.New(respType.Elem()).Interface()
+		pending:              map[K][]chan<- response[Resp]{},
 	}
 }
 
@@ -109,27 +96,32 @@ func createFactory(stream Stream) func() interface{} {
 // either direction -- so servers can initiate operations by sending a message
 // to the client, in addition to the more typical direction where clients
 // initiate operations.
-type Stream interface {
+type Stream[SendType any, ReceiveType any] interface {
 	Context() context.Context
-	SendMsg(m interface{}) error
-	RecvMsg(m interface{}) error
+	Send(SendType) error
+	Recv() (ReceiveType, error)
 }
 
-// StreamAdapter wraps a gRPC stream and implements a simple request-response
+type StreamAdapter[Req any, Resp any] interface {
+	Context() context.Context
+	Call(context.Context, Req) (Resp, error)
+}
+
+// streamAdapter wraps a gRPC stream and implements a simple request-response
 // mechanism on top of it.
-type StreamAdapter struct {
+type streamAdapter[Req any, Resp any, K comparable] struct {
 	ctx                  context.Context
 	cancel               context.CancelFunc
-	stream               Stream
-	responseFactory      func() interface{}
-	requestKeyExtractor  func(interface{}) interface{}
-	responseKeyExtractor func(interface{}) interface{}
+	stream               Stream[Req, Resp]
+	responseFactory      func() Resp
+	requestKeyExtractor  func(Req) K
+	responseKeyExtractor func(Resp) K
 
 	messageCount uint64
 
 	mu      sync.Mutex
 	failure error
-	pending map[interface{}][]chan<- response
+	pending map[K][]chan<- response[Resp]
 }
 
 // Call performs a single request-response round trip. It sends the given
@@ -144,20 +136,21 @@ type StreamAdapter struct {
 // error). If the context times out or is cancelled, nothing happens in the
 // underlying stream, and any response message that eventually arrives will
 // effectively be ignored.
-func (a *StreamAdapter) Call(ctx context.Context, req interface{}) (interface{}, error) {
+func (a *streamAdapter[Req, Resp, K]) Call(ctx context.Context, req Req) (Resp, error) {
 	// optimistically add response acceptor to pending set
-	var key interface{}
+	var key K
 	if a.requestKeyExtractor != nil {
 		key = a.requestKeyExtractor(req)
 	}
-	ch := make(chan response, 1)
+	ch := make(chan response[Resp], 1)
 
+	var zeroResp Resp
 	err, startRecvLoop := a.addPending(key, ch)
 	if err != nil {
-		return nil, err
+		return zeroResp, err
 	}
 
-	if err := a.stream.SendMsg(req); err != nil {
+	if err := a.stream.Send(req); err != nil {
 		// remove from pending set
 		if !a.removePending(key, ch) {
 			// it must have been concurrently removed by recvLoop on stream failure
@@ -168,7 +161,7 @@ func (a *StreamAdapter) Call(ctx context.Context, req interface{}) (interface{},
 				// TODO: shouldn't ever happen... panic?
 			}
 		}
-		return nil, err
+		return zeroResp, err
 	}
 
 	// make sure we have something accepting response messages
@@ -181,11 +174,11 @@ func (a *StreamAdapter) Call(ctx context.Context, req interface{}) (interface{},
 	case r := <-ch:
 		return r.resp, r.err
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return zeroResp, ctx.Err()
 	}
 }
 
-func (a *StreamAdapter) addPending(key interface{}, ch chan<- response) (error, bool) {
+func (a *streamAdapter[Req, Resp, K]) addPending(key K, ch chan<- response[Resp]) (error, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -197,7 +190,7 @@ func (a *StreamAdapter) addPending(key interface{}, ch chan<- response) (error, 
 	return nil, shouldStartRecvLoop
 }
 
-func (a *StreamAdapter) removePending(key interface{}, ch chan<- response) bool {
+func (a *streamAdapter[Req, Resp, K]) removePending(key K, ch chan<- response[Resp]) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -215,20 +208,20 @@ func (a *StreamAdapter) removePending(key interface{}, ch chan<- response) bool 
 }
 
 // Context returns the context associate with this stream.
-func (a *StreamAdapter) Context() context.Context {
+func (a *streamAdapter[Req, Resp, K]) Context() context.Context {
 	return a.ctx
 }
 
-func (a *StreamAdapter) recvLoop() {
+func (a *streamAdapter[Req, Resp, K]) recvLoop() {
 	for {
-		m := a.responseFactory()
-		if err := a.stream.RecvMsg(m); err != nil {
+		m, err := a.stream.Recv()
+		if err != nil {
 			// fail all pending operations and bail
 			a.abortPending(err)
 			return
 		}
 		c := atomic.AddUint64(&a.messageCount, 1)
-		var key interface{}
+		var key K
 		if a.responseKeyExtractor != nil {
 			key = a.responseKeyExtractor(m)
 		}
@@ -239,13 +232,13 @@ func (a *StreamAdapter) recvLoop() {
 	}
 }
 
-func (a *StreamAdapter) replyToPending(resp, key interface{}, count uint64) bool {
+func (a *streamAdapter[Req, Resp, K]) replyToPending(resp Resp, key K, count uint64) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	noMorePending := false
 
-	var ch chan<- response
+	var ch chan<- response[Resp]
 	if chans, ok := a.pending[key]; ok {
 		ch = chans[0]
 		if len(chans) > 1 {
@@ -256,7 +249,7 @@ func (a *StreamAdapter) replyToPending(resp, key interface{}, count uint64) bool
 				noMorePending = true
 			}
 		}
-		ch <- response{resp, nil}
+		ch <- response[Resp]{resp, nil}
 		close(ch)
 	} else {
 		// no pending request that corresponds to the received response?
@@ -273,24 +266,23 @@ func (a *StreamAdapter) replyToPending(resp, key interface{}, count uint64) bool
 	return noMorePending
 }
 
-func (a *StreamAdapter) abortPending(err error) {
+func (a *streamAdapter[Req, Resp, K]) abortPending(err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	a.abortPendingLocked(err)
 }
 
-func (a *StreamAdapter) abortPendingLocked(err error) {
+func (a *streamAdapter[Req, Resp, K]) abortPendingLocked(err error) {
+	var zeroResp Resp
 	for _, chans := range a.pending {
 		for _, ch := range chans {
-			ch <- response{nil, err}
+			ch <- response[Resp]{zeroResp, err}
 			close(ch)
 		}
 	}
-	a.pending = map[interface{}][]chan<- response{}
+	a.pending = map[K][]chan<- response[Resp]{}
 }
-
-var typeOfContext = reflect.TypeOf((*context.Context)(nil)).Elem()
 
 // HandleServerStream reads request messages from the given stream, dispatching
 // them to the given serveFunc. The serveFunc must be a function that either
@@ -320,56 +312,26 @@ var typeOfContext = reflect.TypeOf((*context.Context)(nil)).Elem()
 // have to be a gRPC server though, as a stream could allow clients to accept
 // and process requests this way). For the client side of the stream, see
 // NewStreamAdapter.
-func HandleServerStream(stream Stream, serveFunc interface{}, requestKeyExtractor func(interface{}) interface{}, requestFactory func() interface{}) error {
-	t := reflect.TypeOf(serveFunc)
-	if t.Kind() != reflect.Func {
-		panic("serveFunc must be a function")
-	}
+func HandleServerStream[Req any, Resp any](stream Stream[Resp, Req], handler func(context.Context, Req) Resp) error {
+	return HandleServerStreamWithCorrelationKey[Req, Resp, void](stream, handler, func(Req) void { return void{} })
+}
 
-	hasContext := false
-	okay := false
-	switch t.NumIn() {
-	case 1:
-		if t.In(0).Kind() == reflect.Ptr {
-			okay = true
-		}
-	case 2:
-		if typeOfContext.AssignableTo(t.In(0)) && t.In(1).Kind() == reflect.Ptr {
-			okay = true
-			hasContext = true
-		}
-	}
-	if !okay || t.NumOut() != 1 {
-		panic(fmt.Sprintf("serveFunc has bad signature: %v", t))
-	}
-
-	funcRv := reflect.ValueOf(serveFunc)
-	action := func(ctx context.Context, req interface{}) interface{} {
-		// invoke reflectively
-		var results []reflect.Value
-		if hasContext {
-			results = funcRv.Call([]reflect.Value{reflect.ValueOf(ctx), reflect.ValueOf(req)})
-		} else {
-			results = funcRv.Call([]reflect.Value{reflect.ValueOf(req)})
-		}
-		return results[0].Interface()
-	}
-
-	if requestFactory == nil {
-		requestFactory = createFactory(stream)
-	}
-
-	w := &workers{
+func HandleServerStreamWithCorrelationKey[Req any, Resp any, K comparable](
+	stream Stream[Resp, Req],
+	handler func(context.Context, Req) Resp,
+	requestKeyExtractor func(Req) K,
+) error {
+	w := &workers[Req, Resp, K]{
 		stream:              stream,
-		action:              action,
+		action:              handler,
 		requestKeyExtractor: requestKeyExtractor,
 	}
 	w.ctx, w.cancel = context.WithCancel(stream.Context())
 	defer w.await()
 
 	for {
-		m := requestFactory()
-		if err := stream.RecvMsg(m); err != nil {
+		m, err := stream.Recv()
+		if err != nil {
 			if err == io.EOF {
 				return nil
 			}
@@ -379,33 +341,33 @@ func HandleServerStream(stream Stream, serveFunc interface{}, requestKeyExtracto
 	}
 }
 
-type workers struct {
-	stream              Stream
-	action              func(context.Context, interface{}) interface{}
-	requestKeyExtractor func(interface{}) interface{}
+type workers[Req any, Resp any, K comparable] struct {
+	stream              Stream[Resp, Req]
+	action              func(context.Context, Req) Resp
+	requestKeyExtractor func(Req) K
 	ctx                 context.Context
 	cancel              context.CancelFunc
 	wg                  sync.WaitGroup
 
 	mu      sync.Mutex
-	workers map[interface{}]worker
+	workers map[K]worker[Req]
 }
 
-type worker struct {
-	input chan<- *workRequest
+type worker[T any] struct {
+	input chan<- *workRequest[T]
 }
 
-type workRequest struct {
-	req  interface{}
+type workRequest[T any] struct {
+	req  T
 	skip int32 // used as atomic boolean; set to 1 to retract request
 }
 
-func (w *workers) await() {
+func (w *workers[Req, Resp, K]) await() {
 	w.wg.Wait()
 }
 
-func (w *workers) enqueue(req interface{}) {
-	var key interface{}
+func (w *workers[Req, Resp, K]) enqueue(req Req) {
+	var key K
 	if w.requestKeyExtractor != nil {
 		key = w.requestKeyExtractor(req)
 	}
@@ -421,7 +383,7 @@ func (w *workers) enqueue(req interface{}) {
 		// unlock before trying to send worker a request
 		w.mu.Unlock()
 
-		wr := &workRequest{req: req}
+		wr := &workRequest[Req]{req: req}
 		select {
 		case wk.input <- wr:
 			// worker accepted request? double-check that
@@ -444,8 +406,8 @@ func (w *workers) enqueue(req interface{}) {
 
 	defer w.mu.Unlock()
 
-	input := make(chan *workRequest, 16)
-	wk := worker{input: input}
+	input := make(chan *workRequest[Req], 16)
+	wk := worker[Req]{input: input}
 	w.workers[key] = wk
 
 	// TODO: limit parallelism?
@@ -457,9 +419,9 @@ func (w *workers) enqueue(req interface{}) {
 	}()
 }
 
-func (w *workers) processRequests(key interface{}, input <-chan *workRequest) {
+func (w *workers[Req, Resp, K]) processRequests(key K, input <-chan *workRequest[Req]) {
 	for {
-		var req *workRequest
+		var req *workRequest[Req]
 		select {
 		case req = <-input:
 			if !w.processOneRequest(req) {
@@ -498,13 +460,13 @@ func (w *workers) processRequests(key interface{}, input <-chan *workRequest) {
 	}
 }
 
-func (w *workers) processOneRequest(req *workRequest) bool {
+func (w *workers[Req, Resp, K]) processOneRequest(req *workRequest[Req]) bool {
 	if !atomic.CompareAndSwapInt32(&req.skip, 0, -1) {
 		// request was already marked, so skip
 		return true
 	}
-	resp := w.action(w.ctx, req)
-	if err := w.stream.SendMsg(resp); err != nil {
+	resp := w.action(w.ctx, req.req)
+	if err := w.stream.Send(resp); err != nil {
 		w.cancel()
 		// stream is in bad state
 		return false
