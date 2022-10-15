@@ -10,6 +10,7 @@ import (
 	"github.com/fullstorydev/grpchan/grpchantesting"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/jhump/grpctunnel/tunnelpb"
 )
@@ -19,17 +20,19 @@ func TestTunnelServer(t *testing.T) {
 
 	var svr grpchantesting.TestServer
 
-	ready := make(chan struct{})
 	ts := NewTunnelServiceHandler(TunnelServiceHandlerOptions{
-		OnReverseTunnelConnect: func(ReverseTunnelChannel) {
-			// don't block; just make sure there's something in the channel
-			select {
-			case ready <- struct{}{}:
-			default:
+		AffinityKey: func(t ReverseTunnelChannel) any {
+			vals := t.RequestHeaders().Get("nesting-level")
+			if len(vals) == 0 {
+				return ""
 			}
+			return vals[0]
 		},
 	})
 	grpchantesting.RegisterTestServiceServer(ts, &svr)
+	// recursive: tunnels can be run on top of tunnels
+	// (not realistic, but fun exercise to verify soundness of protocol)
+	tunnelpb.RegisterTunnelServiceServer(ts, ts.Service())
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -58,38 +61,85 @@ func TestTunnelServer(t *testing.T) {
 	// way, we don't incorrectly think they are leaked goroutines.
 	time.Sleep(500 * time.Millisecond)
 
-	t.Run("forward", func(t *testing.T) {
+	runTests(context.Background(), t, false, cli, ts, &svr)
+}
+
+func runTests(ctx context.Context, t *testing.T, nested bool, cli tunnelpb.TunnelServiceClient, ts *TunnelServiceHandler, testSvr *grpchantesting.TestServer) {
+	if nested {
+		ctx = metadata.AppendToOutgoingContext(ctx, "nesting-level", "1")
+	}
+
+	prefix := ""
+	if nested {
+		prefix = "nested-"
+	}
+	t.Run(prefix+"forward", func(t *testing.T) {
 		checkForGoroutineLeak(t, func() {
-			tunnel, err := cli.OpenTunnel(context.Background())
+			tunnel, err := cli.OpenTunnel(ctx)
 			if err != nil {
 				t.Fatalf("failed to open tunnel: %v", err)
 			}
 
 			ch := NewChannel(tunnel)
-			defer ch.Close()
+			defer func() {
+				ch.Close()
+				<-ch.Done()
+				if err := ch.Err(); err != nil {
+					t.Errorf("channel ended with error: %v", err)
+				}
+			}()
 
 			grpchantesting.RunChannelTestCases(t, ch, true)
+
+			if !nested {
+				// nested/recursive test
+				runTests(ch.Context(), t, true, tunnelpb.NewTunnelServiceClient(ch), ts, testSvr)
+			}
 		})
 	})
 
-	t.Run("reverse", func(t *testing.T) {
+	t.Run(prefix+"reverse", func(t *testing.T) {
 		checkForGoroutineLeak(t, func() {
 			revSvr := NewReverseTunnelServer(cli)
-			grpchantesting.RegisterTestServiceServer(revSvr, &svr)
+			if !nested {
+				// we need this to run the nested/recursive tunnel test
+				tunnelpb.RegisterTunnelServiceServer(revSvr, ts.Service())
+			}
+			defer revSvr.Stop()
+			grpchantesting.RegisterTestServiceServer(revSvr, testSvr)
 			go func() {
-				if err, _ := revSvr.Serve(context.Background()); err != nil {
-					t.Logf("ReverseTunnelServer.Serve returned error: %v", err)
+				if err, _ := revSvr.Serve(ctx); err != nil {
+					t.Errorf("ReverseTunnelServer.Serve returned error: %v", err)
 				}
-			}()
-			defer func() {
-				revSvr.Stop()
 			}()
 
 			// make sure server has registered client, so we can issue RPCs to it
-			<-ready
-			ch := ts.AsChannel()
+			var ch ReverseClientConnInterface
+			if nested {
+				ch = ts.KeyAsChannel("1")
+			} else {
+				ch = ts.AsChannel()
+			}
+			timedCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			err := ch.WaitForReady(timedCtx)
+			if err != nil {
+				t.Fatalf("reverse channel never became ready: %v", err)
+				return
+			}
 
 			grpchantesting.RunChannelTestCases(t, ch, true)
+
+			if !nested {
+				// nested/recursive test
+				runTests(ctx, t, true, tunnelpb.NewTunnelServiceClient(ch), ts, testSvr)
+			}
+
+			for i, rt := range ts.AllReverseTunnels() {
+				if err := rt.Err(); err != nil {
+					t.Errorf("reverse tunnel channel %d ended with error: %v", i, err)
+				}
+			}
 		})
 	})
 }

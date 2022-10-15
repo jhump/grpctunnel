@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"sync"
 
 	"github.com/golang/protobuf/proto"
@@ -22,17 +23,18 @@ import (
 // implements [grpc.ClientConnInterface], so it can be used to create stubs
 // and issue other RPCs, which are all carried over the given stream.
 func NewChannel(stream tunnelpb.TunnelService_OpenTunnelClient) TunnelChannel {
-	return newTunnelChannel(stream, stream.CloseSend)
+	return newTunnelChannel(stream, func() { _ = stream.CloseSend() })
 }
 
-func newReverseChannel(stream tunnelpb.TunnelService_OpenReverseTunnelServer) *reverseTunnelChannel {
+func newReverseChannel(stream tunnelpb.TunnelService_OpenReverseTunnelServer, onClose func(channel *reverseTunnelChannel)) *reverseTunnelChannel {
 	md, _ := metadata.FromIncomingContext(stream.Context())
 	p, _ := peer.FromContext(stream.Context())
-	return &reverseTunnelChannel{
-		tunnelChannel:  newTunnelChannel(stream, nil),
+	rt := &reverseTunnelChannel{
 		requestHeaders: md,
 		peer:           p,
 	}
+	rt.tunnelChannel = newTunnelChannel(stream, func() { onClose(rt) })
+	return rt
 }
 
 type tunnelStreamClient interface {
@@ -60,10 +62,9 @@ type TunnelChannel interface {
 	Context() context.Context
 	// Done returns a channel that can be used to await the channel closing.
 	Done() <-chan struct{}
-	// Err returns the error that caused the channel to close.
+	// Err returns the error that caused the channel to close. If the channel
+	// is not yet closed, this will return nil.
 	Err() error
-	// IsDone returns true once the channel is closed.
-	IsDone() bool
 }
 
 // ReverseTunnelChannel is a special gRPC connection that uses a gRPC stream
@@ -104,7 +105,7 @@ type tunnelChannel struct {
 	stream   tunnelStreamClient
 	ctx      context.Context
 	cancel   context.CancelFunc
-	tearDown func() error
+	tearDown func()
 
 	mu            sync.RWMutex
 	streams       map[int64]*tunnelClientStream
@@ -114,7 +115,7 @@ type tunnelChannel struct {
 	finished      bool
 }
 
-func newTunnelChannel(stream tunnelStreamClient, tearDown func() error) *tunnelChannel {
+func newTunnelChannel(stream tunnelStreamClient, tearDown func()) *tunnelChannel {
 	ctx, cancel := context.WithCancel(stream.Context())
 	c := &tunnelChannel{
 		stream:   stream,
@@ -133,15 +134,6 @@ func (c *tunnelChannel) Context() context.Context {
 
 func (c *tunnelChannel) Done() <-chan struct{} {
 	return c.ctx.Done()
-}
-
-func (c *tunnelChannel) IsDone() bool {
-	if c.ctx.Err() != nil {
-		return true
-	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.finished
 }
 
 func (c *tunnelChannel) Err() error {
@@ -172,7 +164,25 @@ func (c *tunnelChannel) Invoke(ctx context.Context, methodName string, req, resp
 	if err := str.CloseSend(); err != nil {
 		return err
 	}
-	return str.RecvMsg(resp)
+	err = str.RecvMsg(resp)
+	if err != nil {
+		return err
+	}
+	// Make sure there are no more messages on the stream.
+	// Allocate another response (to make sure this call to
+	// RecvMsg can't modify the resp we already received).
+	rv := reflect.Indirect(reflect.ValueOf(resp))
+	extraResp := reflect.New(rv.Type()).Interface()
+	extraErr := str.RecvMsg(extraResp)
+	switch extraErr {
+	case nil:
+		return status.Errorf(codes.Internal, "unary RPC returned >1 response message")
+	case io.EOF:
+		// this is what we want: nothing else in the stream
+		return nil
+	default:
+		return err
+	}
 }
 
 func (c *tunnelChannel) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodName string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
@@ -199,7 +209,7 @@ func (c *tunnelChannel) newStream(ctx context.Context, clientStreams, serverStre
 	}
 	go func() {
 		// if context gets cancelled, make sure
-		// we shutdown the stream
+		// we shut down the stream
 		<-str.ctx.Done()
 		str.cancel(str.ctx.Err())
 	}()
@@ -335,7 +345,7 @@ func (c *tunnelChannel) removeStream(streamID int64) {
 
 func (c *tunnelChannel) close(err error) bool {
 	if c.tearDown != nil {
-		_ = c.tearDown()
+		c.tearDown()
 	}
 
 	c.mu.Lock()

@@ -32,7 +32,7 @@ type TunnelServiceHandler struct {
 	affinityKey               func(ReverseTunnelChannel) any
 
 	stopping atomic.Bool
-	reverse  reverseChannels
+	reverse  *reverseChannels
 
 	mu           sync.RWMutex
 	reverseByKey map[interface{}]*reverseChannels
@@ -72,6 +72,7 @@ func NewTunnelServiceHandler(options TunnelServiceHandlerOptions) *TunnelService
 		onReverseTunnelConnect:    options.OnReverseTunnelConnect,
 		onReverseTunnelDisconnect: options.OnReverseTunnelDisconnect,
 		affinityKey:               options.AffinityKey,
+		reverse:                   newReverseChannels(),
 		reverseByKey:              map[interface{}]*reverseChannels{},
 	}
 }
@@ -114,7 +115,7 @@ func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_O
 		return status.Error(codes.Unimplemented, "reverse tunnels not supported")
 	}
 
-	ch := newReverseChannel(stream)
+	ch := newReverseChannel(stream, s.unregister)
 	defer ch.Close()
 
 	var key interface{}
@@ -122,21 +123,11 @@ func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_O
 		key = s.affinityKey(ch)
 	}
 
-	s.reverse.add(ch)
+	s.reverse.add(ch, key)
 	defer s.reverse.remove(ch)
 
-	rc := func() *reverseChannels {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-
-		rc := s.reverseByKey[key]
-		if rc == nil {
-			rc = &reverseChannels{}
-			s.reverseByKey[key] = rc
-		}
-		return rc
-	}()
-	rc.add(ch)
+	rc := s.reverseChannelsForKey(key)
+	rc.add(ch, key)
 	defer rc.remove(ch)
 
 	if s.onReverseTunnelConnect != nil {
@@ -148,6 +139,21 @@ func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_O
 
 	<-ch.Done()
 	return ch.Err()
+}
+
+func (s *TunnelServiceHandler) unregister(ch *reverseTunnelChannel) {
+	k, ok := s.reverse.remove(ch)
+	if !ok {
+		// already removed
+		return
+	}
+
+	s.mu.Lock()
+	rc := s.reverseByKey[k]
+	s.mu.Unlock()
+	if rc != nil {
+		rc.remove(ch)
+	}
 }
 
 type tunnelServiceHandler struct {
@@ -165,8 +171,20 @@ func (s *tunnelServiceHandler) OpenReverseTunnel(stream tunnelpb.TunnelService_O
 
 type reverseChannels struct {
 	mu    sync.Mutex
-	chans []*reverseTunnelChannel
+	avail chan struct{}
+	chans []reverseChannelEntry
 	idx   int
+}
+
+type reverseChannelEntry struct {
+	ch  *reverseTunnelChannel
+	key any
+}
+
+func newReverseChannels() *reverseChannels {
+	return &reverseChannels{
+		avail: make(chan struct{}),
+	}
 }
 
 func (c *reverseChannels) allChans() []ReverseTunnelChannel {
@@ -175,7 +193,7 @@ func (c *reverseChannels) allChans() []ReverseTunnelChannel {
 
 	cp := make([]ReverseTunnelChannel, len(c.chans))
 	for i := range c.chans {
-		cp[i] = c.chans[i]
+		cp[i] = c.chans[i].ch
 	}
 	return cp
 }
@@ -195,25 +213,55 @@ func (c *reverseChannels) pick() grpc.ClientConnInterface {
 	if c.idx >= len(c.chans) {
 		c.idx = 0
 	}
-	return c.chans[c.idx]
+	return c.chans[c.idx].ch
 }
 
-func (c *reverseChannels) add(ch *reverseTunnelChannel) {
+func (c *reverseChannels) add(ch *reverseTunnelChannel, key any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.chans = append(c.chans, ch)
+	c.chans = append(c.chans, reverseChannelEntry{ch: ch, key: key})
+	if len(c.chans) == 1 {
+		// first channel means we are now ready
+		close(c.avail)
+	}
 }
 
-func (c *reverseChannels) remove(ch *reverseTunnelChannel) {
+func (c *reverseChannels) remove(ch *reverseTunnelChannel) (any, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	for i := range c.chans {
-		if c.chans[i] == ch {
+		if c.chans[i].ch == ch {
+			key := c.chans[i].key
 			c.chans = append(c.chans[:i], c.chans[i+1:]...)
-			break
+			if len(c.chans) == 0 {
+				// need a new channel for waiting on ready
+				c.avail = make(chan struct{})
+			}
+			return key, true
 		}
+	}
+	return nil, false
+}
+
+func (c *reverseChannels) ready() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return len(c.chans) > 0
+}
+
+func (c *reverseChannels) waitForReady(ctx context.Context) error {
+	c.mu.Lock()
+	avail := c.avail
+	c.mu.Unlock()
+
+	select {
+	case <-avail:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -231,11 +279,15 @@ func (s *TunnelServiceHandler) AllReverseTunnels() []ReverseTunnelChannel {
 //
 // This method panics if the handler was created with an option to disallow the
 // use of reverse tunnels.
-func (s *TunnelServiceHandler) AsChannel() grpc.ClientConnInterface {
+func (s *TunnelServiceHandler) AsChannel() ReverseClientConnInterface {
 	if s.noReverseTunnels {
 		panic("reverse tunnels not supported")
 	}
-	return multiChannel(s.reverse.pick)
+	return multiChannel{
+		pick:         s.reverse.pick,
+		ready:        s.reverse.ready,
+		waitForReady: s.reverse.waitForReady,
+	}
 }
 
 // KeyAsChannel returns a channel that can be used for issuing RPCs back to
@@ -249,26 +301,85 @@ func (s *TunnelServiceHandler) AsChannel() grpc.ClientConnInterface {
 //
 // This method panics if the handler was created with an option to disallow the
 // use of reverse tunnels.
-func (s *TunnelServiceHandler) KeyAsChannel(key interface{}) grpc.ClientConnInterface {
+func (s *TunnelServiceHandler) KeyAsChannel(key interface{}) ReverseClientConnInterface {
 	if s.noReverseTunnels {
 		panic("reverse tunnels not supported")
 	}
-	return multiChannel(func() grpc.ClientConnInterface {
-		return s.pickKey(key)
-	})
+	return multiChannel{
+		pick: func() grpc.ClientConnInterface {
+			return s.pickKey(key)
+		},
+		ready: func() bool {
+			return s.keyIsReady(key)
+		},
+		waitForReady: func(ctx context.Context) error {
+			return s.waitForKeyReady(ctx, key)
+		},
+	}
 }
 
 func (s *TunnelServiceHandler) pickKey(key interface{}) grpc.ClientConnInterface {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	rc := s.reverseByKey[key]
+	s.mu.RUnlock()
 
-	return s.reverseByKey[key].pick()
+	if rc == nil {
+		return nil
+	}
+	return rc.pick()
 }
 
-type multiChannel func() grpc.ClientConnInterface
+func (s *TunnelServiceHandler) keyIsReady(key interface{}) bool {
+	s.mu.RLock()
+	rc := s.reverseByKey[key]
+	s.mu.RUnlock()
+
+	if rc == nil {
+		return false
+	}
+	return rc.ready()
+}
+
+func (s *TunnelServiceHandler) waitForKeyReady(ctx context.Context, key interface{}) error {
+	rc := s.reverseChannelsForKey(key)
+	return rc.waitForReady(ctx)
+}
+
+func (s *TunnelServiceHandler) reverseChannelsForKey(key any) *reverseChannels {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rc := s.reverseByKey[key]
+	if rc == nil {
+		rc = newReverseChannels()
+		s.reverseByKey[key] = rc
+	}
+	return rc
+}
+
+// ReverseClientConnInterface is an RPC channel that reports if there are any
+// active reverse tunnels. If there are no available tunnels, the channel will
+// not be ready.
+type ReverseClientConnInterface interface {
+	grpc.ClientConnInterface
+	// Ready returns true if this channel is backed by at least one reverse
+	// tunnel. Returns false if there are no active, matching reverse tunnels.
+	Ready() bool
+	// WaitForReady blocks until either this channel is ready or the given
+	// context is cancelled or times out. If the latter, the context error is
+	// returned. Otherwise, nil is returned. If the channel is immediately
+	// ready, this will not block and will immediately return nil.
+	WaitForReady(context.Context) error
+}
+
+type multiChannel struct {
+	pick         func() grpc.ClientConnInterface
+	ready        func() bool
+	waitForReady func(context.Context) error
+}
 
 func (c multiChannel) Invoke(ctx context.Context, methodName string, req, resp interface{}, opts ...grpc.CallOption) error {
-	ch := c()
+	ch := c.pick()
 	if ch == nil {
 		return status.Errorf(codes.Unavailable, "no channels ready")
 	}
@@ -276,9 +387,17 @@ func (c multiChannel) Invoke(ctx context.Context, methodName string, req, resp i
 }
 
 func (c multiChannel) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodName string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-	ch := c()
+	ch := c.pick()
 	if ch == nil {
 		return nil, status.Errorf(codes.Unavailable, "no channels ready")
 	}
 	return ch.NewStream(ctx, desc, methodName, opts...)
+}
+
+func (c multiChannel) Ready() bool {
+	return c.ready()
+}
+
+func (c multiChannel) WaitForReady(ctx context.Context) error {
+	return c.waitForReady(ctx)
 }
