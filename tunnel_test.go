@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/fullstorydev/grpchan/grpchantesting"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -35,24 +37,24 @@ func TestTunnelServer(t *testing.T) {
 	tunnelpb.RegisterTunnelServiceServer(ts, ts.Service())
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
-	}
+	require.NoError(t, err, "failed to listen")
 	gs := grpc.NewServer()
 	tunnelpb.RegisterTunnelServiceServer(gs, ts.Service())
+	serveDone := make(chan struct{})
 	go func() {
-		if err := gs.Serve(l); err != nil {
-			t.Logf("error from grpc server: %v", err)
-		}
+		defer close(serveDone)
+		assert.NoError(t, gs.Serve(l), "error from grpc server")
 	}()
-	defer gs.Stop()
+	defer func() {
+		gs.Stop()
+		<-serveDone
+	}()
 
 	cc, err := grpc.Dial(l.Addr().String(), grpc.WithBlock(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("failed to create client: %v", err)
-	}
+	require.NoError(t, err, "failed top create client")
 	defer func() {
-		_ = cc.Close()
+		err := cc.Close()
+		require.NoError(t, err, "failed to close client conn")
 	}()
 
 	cli := tunnelpb.NewTunnelServiceClient(cc)
@@ -76,17 +78,13 @@ func runTests(ctx context.Context, t *testing.T, nested bool, cli tunnelpb.Tunne
 	t.Run(prefix+"forward", func(t *testing.T) {
 		checkForGoroutineLeak(t, func() {
 			tunnel, err := cli.OpenTunnel(ctx)
-			if err != nil {
-				t.Fatalf("failed to open tunnel: %v", err)
-			}
+			require.NoError(t, err, "failed to open tunnel")
 
 			ch := NewChannel(tunnel)
 			defer func() {
 				ch.Close()
 				<-ch.Done()
-				if err := ch.Err(); err != nil {
-					t.Errorf("channel ended with error: %v", err)
-				}
+				assert.NoError(t, ch.Err(), "channel ended with error")
 			}()
 
 			grpchantesting.RunChannelTestCases(t, ch, true)
@@ -105,12 +103,17 @@ func runTests(ctx context.Context, t *testing.T, nested bool, cli tunnelpb.Tunne
 				// we need this to run the nested/recursive tunnel test
 				tunnelpb.RegisterTunnelServiceServer(revSvr, ts.Service())
 			}
-			defer revSvr.Stop()
 			grpchantesting.RegisterTestServiceServer(revSvr, testSvr)
+			serveDone := make(chan struct{})
 			go func() {
-				if err, _ := revSvr.Serve(ctx); err != nil {
-					t.Errorf("ReverseTunnelServer.Serve returned error: %v", err)
-				}
+				defer close(serveDone)
+				err, ok := revSvr.Serve(ctx)
+				assert.True(t, ok, "ReverseTunnelServer.Serve returned false")
+				assert.NoError(t, err, "ReverseTunnelServer.Serve returned error")
+			}()
+			defer func() {
+				revSvr.Stop()
+				<-serveDone
 			}()
 
 			// make sure server has registered client, so we can issue RPCs to it
@@ -123,10 +126,7 @@ func runTests(ctx context.Context, t *testing.T, nested bool, cli tunnelpb.Tunne
 			timedCtx, cancel := context.WithTimeout(ctx, time.Second)
 			defer cancel()
 			err := ch.WaitForReady(timedCtx)
-			if err != nil {
-				t.Fatalf("reverse channel never became ready: %v", err)
-				return
-			}
+			require.NoError(t, err, "reverse channel never became ready")
 
 			grpchantesting.RunChannelTestCases(t, ch, true)
 
@@ -136,9 +136,7 @@ func runTests(ctx context.Context, t *testing.T, nested bool, cli tunnelpb.Tunne
 			}
 
 			for i, rt := range ts.AllReverseTunnels() {
-				if err := rt.Err(); err != nil {
-					t.Errorf("reverse tunnel channel %d ended with error: %v", i, err)
-				}
+				assert.NoError(t, rt.Err(), "reverse tunnel channel %d ended with error", i)
 			}
 		})
 	})
