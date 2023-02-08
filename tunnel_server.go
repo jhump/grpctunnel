@@ -9,11 +9,11 @@ import (
 	"sync"
 
 	"github.com/fullstorydev/grpchan"
-	"github.com/golang/protobuf/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/jhump/grpctunnel/tunnelpb"
 )
@@ -60,20 +60,19 @@ func (s *tunnelServer) serve() error {
 		}
 
 		if f, ok := in.Frame.(*tunnelpb.ClientToServer_NewStream); ok {
-			if err, ok := s.createStream(ctx, in.StreamId, f.NewStream); err != nil {
+			if ok, err := s.createStream(ctx, in.StreamId, f.NewStream); err != nil {
 				if !ok {
 					return err
-				} else {
-					st, _ := status.FromError(err)
-					_ = s.stream.Send(&tunnelpb.ServerToClient{
-						StreamId: in.StreamId,
-						Frame: &tunnelpb.ServerToClient_CloseStream{
-							CloseStream: &tunnelpb.CloseStream{
-								Status: st.Proto(),
-							},
-						},
-					})
 				}
+				st, _ := status.FromError(err)
+				_ = s.stream.Send(&tunnelpb.ServerToClient{
+					StreamId: in.StreamId,
+					Frame: &tunnelpb.ServerToClient_CloseStream{
+						CloseStream: &tunnelpb.CloseStream{
+							Status: st.Proto(),
+						},
+					},
+				})
 			}
 			continue
 		}
@@ -86,9 +85,9 @@ func (s *tunnelServer) serve() error {
 	}
 }
 
-func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *tunnelpb.NewStream) (error, bool) {
+func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *tunnelpb.NewStream) (bool, error) {
 	if s.isClosing() {
-		return status.Errorf(codes.Unavailable, "server is shutting down"), true
+		return true, status.Errorf(codes.Unavailable, "server is shutting down")
 	}
 
 	s.mu.Lock()
@@ -97,10 +96,10 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 	_, ok := s.streams[streamID]
 	if ok {
 		// stream already active!
-		return fmt.Errorf("cannot create stream ID %d: already exists", streamID), false
+		return false, fmt.Errorf("cannot create stream ID %d: already exists", streamID)
 	}
 	if streamID <= s.lastSeen {
-		return fmt.Errorf("cannot create stream ID %d: that ID has already been used", streamID), false
+		return false, fmt.Errorf("cannot create stream ID %d: that ID has already been used", streamID)
 	}
 	s.lastSeen = streamID
 
@@ -109,7 +108,7 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 	}
 	parts := strings.SplitN(frame.MethodName, "/", 2)
 	if len(parts) != 2 {
-		return status.Errorf(codes.InvalidArgument, "%s is not a well-formed method name", frame.MethodName), true
+		return true, status.Errorf(codes.InvalidArgument, "%s is not a well-formed method name", frame.MethodName)
 	}
 	var md interface{}
 	sd, svc := s.services.QueryService(parts[0])
@@ -122,11 +121,11 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 	}
 
 	if md == nil {
-		return status.Errorf(codes.Unimplemented, "%s not implemented", frame.MethodName), true
+		return true, status.Errorf(codes.Unimplemented, "%s not implemented", frame.MethodName)
 	}
 	ctx = metadata.NewIncomingContext(ctx, fromProto(frame.RequestHeaders))
 
-	ch := make(chan tunnelpb.IsClientToServer_Frame, 1)
+	ch := make(chan tunnelpb.ClientToServerFrame, 1)
 	str := &tunnelServerStream{
 		ctx:            ctx,
 		svr:            s,
@@ -141,7 +140,7 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 	s.streams[streamID] = str
 	str.ctx = grpc.NewContextWithServerTransportStream(str.ctx, (*tunnelServerTransportStream)(str))
 	go str.serveStream(md, svc)
-	return nil, true
+	return true, nil
 }
 
 func (s *tunnelServer) getStream(streamID int64) (*tunnelServerStream, error) {
@@ -193,12 +192,12 @@ type tunnelServerStream struct {
 
 	// for "ingesting" frames into channel, from receive loop
 	ingestMu   sync.Mutex
-	ingestChan chan<- tunnelpb.IsClientToServer_Frame
+	ingestChan chan<- tunnelpb.ClientToServerFrame
 	halfClosed error
 
 	// for reading frames from channel, to read message data
 	readMu   sync.Mutex
-	readChan <-chan tunnelpb.IsClientToServer_Frame
+	readChan <-chan tunnelpb.ClientToServerFrame
 	readErr  error
 
 	// for sending frames to client
@@ -210,7 +209,7 @@ type tunnelServerStream struct {
 	closed      bool
 }
 
-func (st *tunnelServerStream) acceptClientFrame(frame tunnelpb.IsClientToServer_Frame) {
+func (st *tunnelServerStream) acceptClientFrame(frame tunnelpb.ClientToServerFrame) {
 	if st == nil {
 		// can happen if server decided that the stream ID was recently used
 		// yet inactive -- it returns nil error but also nil stream, which
@@ -384,7 +383,7 @@ func (st *tunnelServerStream) SendMsg(m interface{}) error {
 }
 
 func (st *tunnelServerStream) RecvMsg(m interface{}) error {
-	data, err, ok := st.readMsg()
+	data, ok, err := st.readMsg()
 	if err != nil {
 		if !ok {
 			st.finishStream(err)
@@ -395,31 +394,31 @@ func (st *tunnelServerStream) RecvMsg(m interface{}) error {
 	return proto.Unmarshal(data, m.(proto.Message))
 }
 
-func (st *tunnelServerStream) readMsg() (data []byte, err error, ok bool) {
+func (st *tunnelServerStream) readMsg() (data []byte, ok bool, err error) {
 	st.readMu.Lock()
 	defer st.readMu.Unlock()
 
-	data, err, ok = st.readMsgLocked()
+	data, ok, err = st.readMsgLocked()
 	if err == nil && !st.isClientStream {
 		// no stream; so eagerly see if there's another message
 		// and fail RPC if so (due to bad input)
-		_, err, ok := st.readMsgLocked()
+		_, ok, err := st.readMsgLocked()
 		if err == nil {
 			err = status.Errorf(codes.InvalidArgument, "Already received request for non-client-stream method %s", st.method)
 			st.readErr = err
-			return nil, err, false
+			return nil, false, err
 		}
 		if err != io.EOF || !ok {
-			return nil, err, ok
+			return nil, ok, err
 		}
 	}
 
-	return data, err, ok
+	return data, ok, err
 }
 
-func (st *tunnelServerStream) readMsgLocked() (data []byte, err error, ok bool) {
+func (st *tunnelServerStream) readMsgLocked() (data []byte, ok bool, err error) {
 	if st.readErr != nil {
-		return nil, st.readErr, true
+		return nil, true, st.readErr
 	}
 
 	defer func() {
@@ -433,50 +432,50 @@ func (st *tunnelServerStream) readMsgLocked() (data []byte, err error, ok bool) 
 	for {
 		// if stream is canceled, return context error
 		if err := st.ctx.Err(); err != nil {
-			return nil, err, true
+			return nil, true, err
 		}
 
 		// otherwise, try to read request data, but interrupt if
 		// stream is canceled or half-closed
 		select {
 		case <-st.ctx.Done():
-			return nil, st.ctx.Err(), true
+			return nil, true, st.ctx.Err()
 
 		case in, ok := <-st.readChan:
 			if !ok {
 				// don't need lock to read st.halfClosed; observing
 				// input channel close provides safe visibility
-				return nil, st.halfClosed, true
+				return nil, true, st.halfClosed
 			}
 
 			switch in := in.(type) {
 			case *tunnelpb.ClientToServer_RequestMessage:
 				if msgLen != -1 {
-					return nil, status.Errorf(codes.InvalidArgument, "received redundant request message envelope"), false
+					return nil, false, status.Errorf(codes.InvalidArgument, "received redundant request message envelope")
 				}
 				msgLen = int(in.RequestMessage.Size)
 				b = in.RequestMessage.Data
 				if len(b) > msgLen {
-					return nil, status.Errorf(codes.InvalidArgument, "received more data than indicated by request message envelope"), false
+					return nil, false, status.Errorf(codes.InvalidArgument, "received more data than indicated by request message envelope")
 				}
 				if len(b) == msgLen {
-					return b, nil, true
+					return b, true, nil
 				}
 
 			case *tunnelpb.ClientToServer_MoreRequestData:
 				if msgLen == -1 {
-					return nil, status.Errorf(codes.InvalidArgument, "never received envelope for request message"), false
+					return nil, false, status.Errorf(codes.InvalidArgument, "never received envelope for request message")
 				}
 				b = append(b, in.MoreRequestData...)
 				if len(b) > msgLen {
-					return nil, status.Errorf(codes.InvalidArgument, "received more data than indicated by request message envelope"), false
+					return nil, false, status.Errorf(codes.InvalidArgument, "received more data than indicated by request message envelope")
 				}
 				if len(b) == msgLen {
-					return b, nil, true
+					return b, true, nil
 				}
 
 			default:
-				return nil, status.Errorf(codes.InvalidArgument, "unrecognized frame type: %T", in), false
+				return nil, false, status.Errorf(codes.InvalidArgument, "unrecognized frame type: %T", in)
 			}
 		}
 	}
