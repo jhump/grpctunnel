@@ -28,11 +28,8 @@ func NewChannel(stream tunnelpb.TunnelService_OpenTunnelClient) TunnelChannel {
 }
 
 func newReverseChannel(stream tunnelpb.TunnelService_OpenReverseTunnelServer, onClose func(channel *reverseTunnelChannel)) *reverseTunnelChannel {
-	md, _ := metadata.FromIncomingContext(stream.Context())
-	p, _ := peer.FromContext(stream.Context())
 	rt := &reverseTunnelChannel{
-		requestHeaders: md,
-		peer:           p,
+		ctx: stream.Context(),
 	}
 	rt.tunnelChannel = newTunnelChannel(stream, func() { onClose(rt) })
 	return rt
@@ -103,26 +100,22 @@ func (h *halfCloseSafeTunnel) SendMsg(msg interface{}) error {
 // See NewReverseTunnelServer.
 type ReverseTunnelChannel interface {
 	TunnelChannel
-	// RequestHeaders returns the request headers used to construct the
-	// stream over which this tunnel carries RPCs.
-	RequestHeaders() metadata.MD
-	// Peer returns the peer for the tunnel's underlying stream. This is the
-	// identity of the gRPC client that created the reverse tunnel.
-	Peer() *peer.Peer
+	// Context returns the context corresponding to the stream that underlies
+	// the tunnel. Using functions like peer.FromContext and
+	// metadata.FromIncomingContext, the caller can access the identity of the
+	// client that opened the tunnel and any request headers they supplied.
+	// It can also be used to query for any values populated by server
+	// interceptors.
+	Context() context.Context
 }
 
 type reverseTunnelChannel struct {
 	*tunnelChannel
-	requestHeaders metadata.MD
-	peer           *peer.Peer
+	ctx context.Context
 }
 
-func (r *reverseTunnelChannel) RequestHeaders() metadata.MD {
-	return r.requestHeaders
-}
-
-func (r *reverseTunnelChannel) Peer() *peer.Peer {
-	return r.peer
+func (r *reverseTunnelChannel) Context() context.Context {
+	return r.ctx
 }
 
 var _ ReverseTunnelChannel = (*reverseTunnelChannel)(nil)

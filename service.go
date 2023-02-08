@@ -48,10 +48,10 @@ type TunnelServiceHandlerOptions struct {
 	NoReverseTunnels bool
 	// If reverse tunnels are allowed, this callback may be configured to
 	// receive information when clients open a reverse tunnel.
-	OnReverseTunnelConnect func(ReverseTunnelChannel)
+	OnReverseTunnelOpen func(ReverseTunnelChannel)
 	// If reverse tunnels are allowed, this callback may be configured to
 	// receive information when reverse tunnels are torn down.
-	OnReverseTunnelDisconnect func(ReverseTunnelChannel)
+	OnReverseTunnelClose func(ReverseTunnelChannel)
 	// Optional function that accepts a reverse tunnel and returns an affinity
 	// key. The affinity key values can be used to look up outbound channels,
 	// for targeting calls to particular clients or groups of clients.
@@ -69,8 +69,8 @@ func NewTunnelServiceHandler(options TunnelServiceHandlerOptions) *TunnelService
 	return &TunnelServiceHandler{
 		handlers:                  grpchan.HandlerMap{},
 		noReverseTunnels:          options.NoReverseTunnels,
-		onReverseTunnelConnect:    options.OnReverseTunnelConnect,
-		onReverseTunnelDisconnect: options.OnReverseTunnelDisconnect,
+		onReverseTunnelConnect:    options.OnReverseTunnelOpen,
+		onReverseTunnelDisconnect: options.OnReverseTunnelClose,
 		affinityKey:               options.AffinityKey,
 		reverse:                   newReverseChannels(),
 		reverseByKey:              map[interface{}]*reverseChannels{},
