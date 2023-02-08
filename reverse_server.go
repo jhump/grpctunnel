@@ -79,14 +79,14 @@ func (s *ReverseTunnelServer) RegisterService(desc *grpc.ServiceDesc, srv interf
 //
 // Callers may call this repeatedly, to create multiple, concurrent streams to
 // the gRPC server associated with this reverse tunnel server's associated stub.
-func (s *ReverseTunnelServer) Serve(ctx context.Context, opts ...grpc.CallOption) (error, bool) {
+func (s *ReverseTunnelServer) Serve(ctx context.Context, opts ...grpc.CallOption) (started bool, err error) {
 	stream, err := s.stub.OpenReverseTunnel(ctx, opts...)
 	if err != nil {
-		return err, false
+		return false, err
 	}
 	stream = &halfCloseSafeReverseTunnel{TunnelService_OpenReverseTunnelClient: stream}
 	if err := s.addInstance(stream); err != nil {
-		return err, false
+		return false, err
 	}
 	defer s.wg.Done()
 	err = serveTunnel(stream, s.handlers, s.isClosing)
@@ -97,7 +97,7 @@ func (s *ReverseTunnelServer) Serve(ctx context.Context, opts ...grpc.CallOption
 		// an error to caller.
 		err = nil
 	}
-	return err, true
+	return true, err
 }
 
 func (s *ReverseTunnelServer) addInstance(stream tunnelpb.TunnelService_OpenReverseTunnelClient) error {
@@ -169,12 +169,6 @@ type halfCloseSafeReverseTunnel struct {
 	tunnelpb.TunnelService_OpenReverseTunnelClient
 	mu     sync.Mutex
 	closed bool
-}
-
-func (h *halfCloseSafeReverseTunnel) isClosed() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.closed
 }
 
 func (h *halfCloseSafeReverseTunnel) CloseSend() error {

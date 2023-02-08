@@ -4,6 +4,8 @@ package tunnelpb
 
 //go:generate bash -c "cd ../proto && buf generate"
 
-// These are exported for convenience to implementation code in grpctunnel package.
-type IsClientToServer_Frame = isClientToServer_Frame
-type IsServerToClient_Frame = isServerToClient_Frame
+// ClientToServerFrame is the type that is assignable to ClientToServer.Frame.
+type ClientToServerFrame = isClientToServer_Frame
+
+// ServerToClientFrame is the type that is assignable to ServerToClient.Frame.
+type ServerToClientFrame = isServerToClient_Frame

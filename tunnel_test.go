@@ -107,8 +107,8 @@ func runTests(ctx context.Context, t *testing.T, nested bool, cli tunnelpb.Tunne
 			serveDone := make(chan struct{})
 			go func() {
 				defer close(serveDone)
-				err, ok := revSvr.Serve(ctx)
-				assert.True(t, ok, "ReverseTunnelServer.Serve returned false")
+				started, err := revSvr.Serve(ctx)
+				assert.True(t, started, "ReverseTunnelServer.Serve returned false")
 				assert.NoError(t, err, "ReverseTunnelServer.Serve returned error")
 			}()
 			defer func() {

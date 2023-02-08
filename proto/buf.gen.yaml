@@ -1,8 +1,8 @@
 version: v1
 plugins:
-  - name: go
+  - plugin: buf.build/protocolbuffers/go
     out: ../
     opt: [Mgrpctunnel/v1/tunnel.proto=./tunnelpb]
-  - name: go-grpc
+  - plugin: buf.build/grpc/go
     out: ../
     opt: [Mgrpctunnel/v1/tunnel.proto=./tunnelpb]

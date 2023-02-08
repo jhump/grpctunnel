@@ -79,6 +79,9 @@ func NewTunnelServiceHandler(options TunnelServiceHandlerOptions) *TunnelService
 
 var _ grpc.ServiceRegistrar = (*TunnelServiceHandler)(nil)
 
+// RegisterService implements the grpc.ServiceRegistrar interface. This allows the
+// handler to be passed to generated registration functions, so service
+// implementations can be registered with the handler.
 func (s *TunnelServiceHandler) RegisterService(desc *grpc.ServiceDesc, srv interface{}) {
 	s.handlers.RegisterService(desc, srv)
 }
