@@ -24,7 +24,8 @@ func TestTunnelServer(t *testing.T) {
 
 	ts := NewTunnelServiceHandler(TunnelServiceHandlerOptions{
 		AffinityKey: func(t ReverseTunnelChannel) any {
-			vals := t.RequestHeaders().Get("nesting-level")
+			md, _ := metadata.FromIncomingContext(t.Context())
+			vals := md.Get("nesting-level")
 			if len(vals) == 0 {
 				return ""
 			}
