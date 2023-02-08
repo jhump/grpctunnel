@@ -1,6 +1,6 @@
 module github.com/jhump/grpctunnel
 
-go 1.18
+go 1.19
 
 require (
 	github.com/fullstorydev/grpchan v1.1.1

@@ -22,17 +22,6 @@ jobs:
 #      - checkout
 #      - run: go test ./...
 
-  build-1-18:
-    working_directory: ~/repo
-    docker:
-      - image: cimg/go:1.18
-    steps:
-      - checkout
-      - run:
-          name: Run tests
-          command: |
-            make deps test
-
   build-1-19:
     working_directory: ~/repo
     docker:
@@ -88,7 +77,6 @@ workflows:
   pr-build-test:
     jobs:
       # - build-windows
-      - build-1-18
       - build-1-19
       - build-1-19-u
       - build-1-20
