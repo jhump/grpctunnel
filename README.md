@@ -110,9 +110,15 @@ that opened the tunnel is also the one that initiates RPCs through the tunnel.
 sequenceDiagram
     participant network client
     participant network server
-    network client->>network server: opens the tunnel via RPC `grpctunnel.v1.TunnelService/OpenTunnel`
-    network client->>network server: sends RPC request over the tunnel
-    network server->>network client: handles request, sends RPC response over the tunnel
+    network client->>+network server: opens the tunnel via RPC `grpctunnel.v1.TunnelService/OpenTunnel`
+    rect rgb(245, 248, 255)
+      loop forward tunnel created
+        network client->>+network server: sends RPC request over the tunnel
+	network server->>network server: handles request
+        network server->>-network client: sends RPC response over the tunnel
+      end
+    end
+    network server->>-network client: tunnel closed
 ```
 
 ### Client
@@ -191,9 +197,15 @@ tunnel was opened that actually initiates RPCs through the tunnel.
 sequenceDiagram
     participant network client
     participant network server
-    network client->>network server: opens the tunnel via RPC `grpctunnel.v1.TunnelService/OpenReverseTunnel`
-    network server->>network client: sends RPC request over the tunnel
-    network client->>network server: handles request, sends RPC response over the tunnel
+    network client->>+network server: opens the tunnel via RPC `grpctunnel.v1.TunnelService/OpenReverseTunnel`
+    rect rgb(245, 248, 255)
+      loop reverse tunnel created
+        network server->>+network client: sends RPC request over the tunnel
+        network client->>network client: handles request
+        network client->>-network server: sends RPC response over the tunnel
+      end
+    end
+    network server->>-network client: tunnel closed
 ```
 
 Because the typical roles of client and server are reversed, usage of reverse
