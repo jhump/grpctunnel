@@ -20,7 +20,7 @@ import (
 
 const maxChunkSize = 16384
 
-func serveTunnel(stream tunnelStreamServer, handlers grpchan.HandlerMap, isClosing func() bool) error {
+func serveTunnel(stream tunnelStreamServer, tunnelMetadata metadata.MD, handlers grpchan.HandlerMap, isClosing func() bool) error {
 	svr := &tunnelServer{
 		stream:    stream,
 		services:  handlers,
@@ -28,7 +28,7 @@ func serveTunnel(stream tunnelStreamServer, handlers grpchan.HandlerMap, isClosi
 		streams:   map[int64]*tunnelServerStream{},
 		lastSeen:  -1,
 	}
-	return svr.serve()
+	return svr.serve(tunnelMetadata)
 }
 
 type tunnelStreamServer interface {
@@ -47,8 +47,9 @@ type tunnelServer struct {
 	lastSeen int64
 }
 
-func (s *tunnelServer) serve() error {
-	ctx, cancel := context.WithCancel(s.stream.Context())
+func (s *tunnelServer) serve(tunnelMetadata metadata.MD) error {
+	ctx := context.WithValue(s.stream.Context(), tunnelMetadataIncomingContextKey{}, tunnelMetadata)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	for {
 		in, err := s.stream.Recv()

@@ -270,12 +270,12 @@ reverse tunnels:
   track the available tunnels. Each such tunnel is a channel that can be used to
   send RPCs to the corresponding network client.
 * `AffinityKey`: This is a function for grouping reverse tunnels. The function
-  is given a `ReverseTunnelChannel` and returns a key. The function has access
-  to the corresponding stream's context, from which it can query for properties
-  that may be useful for grouping -- such as the authenticated peer, request
-  headers provided when the tunnel was opened, and any other context values that
-  may have been populated by interceptors. All reverse tunnels with the same key
-  can be treated like a connection pool using the handler's
+  is given a `TunnelChannel` and returns a key. The function has access to the
+  corresponding stream's context, from which it can query for properties that
+  may be useful for grouping -- such as the authenticated peer, request headers
+  provided when the tunnel was opened, and any other context values that may
+  have been populated by interceptors. All reverse tunnels with the same key can
+  be treated like a connection pool using the handler's
   [`KeyAsChannel`](https://pkg.go.dev/github.com/jhump/grpctunnel#TunnelServiceHandler.KeyAsChannel)
   method.
 
