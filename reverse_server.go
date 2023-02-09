@@ -8,6 +8,7 @@ import (
 	"github.com/fullstorydev/grpchan"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/jhump/grpctunnel/tunnelpb"
@@ -89,7 +90,10 @@ func (s *ReverseTunnelServer) Serve(ctx context.Context, opts ...grpc.CallOption
 		return false, err
 	}
 	defer s.wg.Done()
-	err = serveTunnel(stream, s.handlers, s.isClosing)
+	// TODO: we don't have a way to access outgoing metadata that gets added by
+	//       client interceptors that may be run by the stub.
+	md, _ := metadata.FromOutgoingContext(ctx)
+	err = serveTunnel(stream, md, s.handlers, s.isClosing)
 	if err == context.Canceled && ctx.Err() == nil && s.isClosed() {
 		// If we get back a cancelled error, but the given context is not
 		// cancelled and this server is closed, then the cancellation was

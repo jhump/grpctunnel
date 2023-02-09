@@ -23,7 +23,7 @@ func TestTunnelServer(t *testing.T) {
 	var svr grpchantesting.TestServer
 
 	ts := NewTunnelServiceHandler(TunnelServiceHandlerOptions{
-		AffinityKey: func(t ReverseTunnelChannel) any {
+		AffinityKey: func(t TunnelChannel) any {
 			md, _ := metadata.FromIncomingContext(t.Context())
 			vals := md.Get("nesting-level")
 			if len(vals) == 0 {

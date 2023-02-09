@@ -2,6 +2,7 @@ package grpctunnel
 
 import (
 	"context"
+	"google.golang.org/grpc/metadata"
 	"sync"
 	"sync/atomic"
 
@@ -27,9 +28,9 @@ import (
 type TunnelServiceHandler struct {
 	handlers                  grpchan.HandlerMap
 	noReverseTunnels          bool
-	onReverseTunnelConnect    func(ReverseTunnelChannel)
-	onReverseTunnelDisconnect func(ReverseTunnelChannel)
-	affinityKey               func(ReverseTunnelChannel) any
+	onReverseTunnelConnect    func(TunnelChannel)
+	onReverseTunnelDisconnect func(TunnelChannel)
+	affinityKey               func(TunnelChannel) any
 
 	stopping atomic.Bool
 	reverse  *reverseChannels
@@ -48,14 +49,21 @@ type TunnelServiceHandlerOptions struct {
 	NoReverseTunnels bool
 	// If reverse tunnels are allowed, this callback may be configured to
 	// receive information when clients open a reverse tunnel.
-	OnReverseTunnelOpen func(ReverseTunnelChannel)
+	OnReverseTunnelOpen func(TunnelChannel)
 	// If reverse tunnels are allowed, this callback may be configured to
 	// receive information when reverse tunnels are torn down.
-	OnReverseTunnelClose func(ReverseTunnelChannel)
+	OnReverseTunnelClose func(TunnelChannel)
 	// Optional function that accepts a reverse tunnel and returns an affinity
 	// key. The affinity key values can be used to look up outbound channels,
 	// for targeting calls to particular clients or groups of clients.
-	AffinityKey func(ReverseTunnelChannel) any
+	//
+	// The given TunnelChannel has a context which can be used to query for the
+	// identity of the remote peer. Functions like peer.FromContext will return
+	// the peer that opened the reverse tunnel, and metadata.FromIncomingContext
+	// will return the request headers used to open the reverse tunnel. If any
+	// server interceptors ran when the tunnel was opened, then any values they
+	// store in the context is also available.
+	AffinityKey func(TunnelChannel) any
 }
 
 // NewTunnelServiceHandler creates a new TunnelServiceHandler. The options are
@@ -64,7 +72,7 @@ type TunnelServiceHandlerOptions struct {
 // for forward tunnels.
 //
 // The handler's Service method can be used to actually register the handler
-// with a *grpc.Server.
+// with a *grpc.Server (or other grpc.ServiceRegistrar).
 func NewTunnelServiceHandler(options TunnelServiceHandlerOptions) *TunnelServiceHandler {
 	return &TunnelServiceHandler{
 		handlers:                  grpchan.HandlerMap{},
@@ -109,8 +117,8 @@ func (s *TunnelServiceHandler) openTunnel(stream tunnelpb.TunnelService_OpenTunn
 	if len(s.handlers) == 0 {
 		return status.Error(codes.Unimplemented, "forward tunnels not supported")
 	}
-
-	return serveTunnel(stream, s.handlers, s.stopping.Load)
+	md, _ := metadata.FromIncomingContext(stream.Context())
+	return serveTunnel(stream, md, s.handlers, s.stopping.Load)
 }
 
 func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_OpenReverseTunnelServer) error {
@@ -144,7 +152,7 @@ func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_O
 	return ch.Err()
 }
 
-func (s *TunnelServiceHandler) unregister(ch *reverseTunnelChannel) {
+func (s *TunnelServiceHandler) unregister(ch *tunnelChannel) {
 	k, ok := s.reverse.remove(ch)
 	if !ok {
 		// already removed
@@ -180,7 +188,7 @@ type reverseChannels struct {
 }
 
 type reverseChannelEntry struct {
-	ch  *reverseTunnelChannel
+	ch  *tunnelChannel
 	key any
 }
 
@@ -190,11 +198,11 @@ func newReverseChannels() *reverseChannels {
 	}
 }
 
-func (c *reverseChannels) allChans() []ReverseTunnelChannel {
+func (c *reverseChannels) allChans() []TunnelChannel {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	cp := make([]ReverseTunnelChannel, len(c.chans))
+	cp := make([]TunnelChannel, len(c.chans))
 	for i := range c.chans {
 		cp[i] = c.chans[i].ch
 	}
@@ -219,7 +227,7 @@ func (c *reverseChannels) pick() grpc.ClientConnInterface {
 	return c.chans[c.idx].ch
 }
 
-func (c *reverseChannels) add(ch *reverseTunnelChannel, key any) {
+func (c *reverseChannels) add(ch *tunnelChannel, key any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -230,7 +238,7 @@ func (c *reverseChannels) add(ch *reverseTunnelChannel, key any) {
 	}
 }
 
-func (c *reverseChannels) remove(ch *reverseTunnelChannel) (any, bool) {
+func (c *reverseChannels) remove(ch *tunnelChannel) (any, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -269,7 +277,7 @@ func (c *reverseChannels) waitForReady(ctx context.Context) error {
 }
 
 // AllReverseTunnels returns the set of all currently active reverse tunnels.
-func (s *TunnelServiceHandler) AllReverseTunnels() []ReverseTunnelChannel {
+func (s *TunnelServiceHandler) AllReverseTunnels() []TunnelChannel {
 	return s.reverse.allChans()
 }
 
@@ -362,7 +370,8 @@ func (s *TunnelServiceHandler) reverseChannelsForKey(key any) *reverseChannels {
 
 // ReverseClientConnInterface is an RPC channel that reports if there are any
 // active reverse tunnels. If there are no available tunnels, the channel will
-// not be ready.
+// not be ready. When tunnels are ready, RPCs will be balanced across all such
+// tunnels in a round-robin fashion.
 type ReverseClientConnInterface interface {
 	grpc.ClientConnInterface
 	// Ready returns true if this channel is backed by at least one reverse
