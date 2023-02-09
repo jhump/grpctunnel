@@ -42,7 +42,7 @@ methods for forward and reverse tunneling.
    cases where the server cannot be directly dialed due to network topology
    (e.g. being behind NAT). In these cases, the server dials a central router
    and registers itself, allowing the router to forward requests to the server
-   over the tunnel.
+   over the reverse tunnel.
 
 ## Terminology
 
@@ -66,8 +66,10 @@ this document will use the following terms to hopefully avoid confusion:
   TCP connections, this is the TCP server.
 * _tunnel client_: The gRPC client that initiates requests on a tunnel.
 * _tunnel server_: The gRPC server handles requests on a tunnel.
-* _reverse tunnel_: A tunnel in which the tunnel client is actually the
-  network server, and the tunnel server is the network client.
+* _forward tunnel_: A tunnel in which the network client is also the tunnel
+  client, and the network server is also the tunnel server.
+* _reverse tunnel_: A tunnel in which the network server is actually the
+  tunnel client, and the network client acts as the tunnel server.
 
 ## Tunnel Handler
 
@@ -293,8 +295,8 @@ most usages:
   allows flexibility for selecting a reverse tunnel, but at a potential
   performance cost since it requires the caller to re-query and re-scan the
   slice prior to issuing an RPC. (Storing the slice and using it for future RPCs
-  is risky because the slice is a snapshot: new reverse tunnels may be opened
-  and items in the slice may be closed.)
+  is risky because the slice is a snapshot that can quickly become stale: new
+  reverse tunnels may be opened and items in the slice may be closed.)
 
 All of these channels can be used just like a `*grpc.ClientConn`, for creating
 RPC stubs and then issuing RPCs to the corresponding network client.
