@@ -167,6 +167,10 @@ underlying stream. If any RPCs are in progress on the channel when it is closed,
 they will be cancelled. The channel is also closed if the context used to create
 the stream is cancelled or times out.
 
+To use client interceptors with these channels, wrap them using
+[`grpchan.InterceptClientConn`](https://pkg.go.dev/github.com/fullstorydev/grpchan#InterceptClientConn)
+before creating stubs.
+
 ### Server
 
 To handle RPCs that are issued over tunnels, the server must register service
@@ -189,6 +193,25 @@ serviceImpl := newBarServer()
 barpb.RegisterBarServer(handler, serviceImpl)
 barpb.RegisterBarServer(svr, serviceImpl)
 ```
+
+To use server interceptors with these handlers, wrap the `TunnelServiceHandler`
+using [`grpchan.WithInterceptor`](https://pkg.go.dev/github.com/fullstorydev/grpchan#WithInterceptor)
+before registering the other handlers.
+
+### Authn/Authz
+
+With forward tunnels, authentication can be done on the initial `OpenTunnel` RPC
+that opens the tunnel. The identity of the client can then be stored in a
+context value, from a server interceptor. These context values are also
+available to server interceptors and handlers that process tunneled requests.
+So an authorization interceptor could extract the client identity from the
+request context.
+
+If using mutual TLS, you can use `peer.FromContext` (part of the gRPC runtime)
+to examine the client's identity, which would have been authenticated via client
+certificate. Like other context values, this value is available to all server
+interceptors and handlers of tunneled requests and will be the same peer that
+opened the tunnel.
 
 ## Reverse Tunnels
 
@@ -253,6 +276,10 @@ The `Serve` function returns once the tunnel is closed, either via the
 tunnel client closing the channel or some other interruption of the
 stream (including the context being cancelled or timing out).
 
+To use server interceptors with these handlers, wrap the `ReverseTunnelServer`
+using [`grpchan.WithInterceptor`](https://pkg.go.dev/github.com/fullstorydev/grpchan#WithInterceptor)
+before registering the other handlers.
+
 ### Server
 
 The network server for reverse services is where things get really interesting.
@@ -300,3 +327,94 @@ most usages:
 
 All of these channels can be used just like a `*grpc.ClientConn`, for creating
 RPC stubs and then issuing RPCs to the corresponding network client.
+
+To use client interceptors with these channels, wrap them using
+[`grpchan.InterceptClientConn`](https://pkg.go.dev/github.com/fullstorydev/grpchan#InterceptClientConn)
+before creating stubs.
+
+### Authn/Authz
+
+With reverse tunnels, authentication is a little different than with forward
+tunnels. The credentials associated with the initial `OpenReverseTunnel` RPC
+are those for the tunnel _server_. Unless you are using mutual TLS (where
+both parties authenticate via certificate), you will need to supply additional
+authentication material with tunneled requests.
+
+One way to send authentication material is to have the client (which is actually
+the network server) use client interceptors to include per-call credentials with
+every request. This approach closely resembles how non-tunneled RPCs are
+handled: both sides use interceptors to send and verify credentials with every
+operation.
+
+A more efficient way involves only authenticating once, since all calls over the
+tunnel will have the same authenticated client. This can be done by having a
+server interceptor that sends authentication materials in _response_ headers.
+These will be received by the client almost immediately after the tunnel is
+opened. This identity can then be stored in the context using a mutable value:
+
+```go
+// Client interceptor for the OpenReverseTunnel RPC:
+func reverseCredentialsInterceptor(
+	ctx context.Context,
+	desc *grpc.StreamDesc,
+	cc *grpc.ClientConn,
+	method string,
+	streamer grpc.Streamer,
+	opts ...grpc.CallOption,
+) (grpc.ClientStream, error) {
+	if method != "/grpctunnel.v1.TunnelService/OpenReverseTunnel" {
+		return streamer(ctx, desc, cc, method, opts...)
+	}
+	// Store mutable value in context.
+	var authInfo any
+	ctx = context.WithValue(ctx, reverseCredentialsKey{}, &authInfo)
+	// Invoke RPC; open the tunnel.
+	stream, err := streamer(ctx, desc, cc, method, opts...)
+	if err != nil {
+		return nil, err
+	}
+	// Get credentials from response headers.
+	md, err := stream.Header()
+	if err != nil {
+		return nil, err
+	}
+	// If authentication fails, authInfo could include details about
+	// the failure so that tunneled RPCs can fail with appropriate
+	// error details.
+	//
+	// An alternative is to just close the tunnel immediately, right
+	// here. But then there is no way to send information about the
+	// authn error to the peer.
+	//
+	// Note that modifying authInfo here is okay. But it is not safe
+	// to modify after returning from this interceptor since that
+	// could lead to data races with tunneled RPCs reading it.
+	authInfo = authenticate(md)
+	return stream, nil
+}
+
+// Server interceptor for tunneled RPCs.
+// (Unary interceptor shown; streaming interceptor would be similar.)
+func tunneledAuthzInterceptor(
+	ctx context.Context,
+	method string,
+	req, reply interface{},
+	cc *grpc.ClientConn,
+	invoker grpc.UnaryInvoker,
+	opts ...grpc.CallOption,
+) error {
+	// Get authInfo from context. This was stored in the context by
+	// the interceptor above. More detailed error messages could be
+	// used or error details added if authInfo contains details about
+	// authn failures.
+	authInfo, ok := ctx.Value(reverseCredentialsKey{}).(*any)
+	if !ok || authInfo == nil || *authInfo == nil {
+		return status.Error(codes.Unauthenticated, "unauthenticated")
+	}
+	if !isAllowed(method, *authInfo) {
+		return status.Error(codes.PermissionDenied, "not authorized")
+	}
+	// RPC is allowed.
+	return invoker(ctx, method, req, reply, cc, opts...)
+}
+```

@@ -126,6 +126,12 @@ func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_O
 		return status.Error(codes.Unimplemented, "reverse tunnels not supported")
 	}
 
+	// Immediately send headers instead of waiting for first RPC to send a message.
+	// This gives any server interceptors a chance to run and potentially to send
+	// auth credentials in response headers (since the client will need a way to
+	// authenticate the server, since roles are reversed with reverse tunnels).
+	_ = stream.SendHeader(nil)
+
 	ch := newReverseChannel(stream, s.unregister)
 	defer ch.Close()
 
