@@ -2,10 +2,10 @@
 version: 2.1
 
 jobs:
-  build-1-19:
+  build-1-21:
     working_directory: ~/repo
     docker:
-      - image: cimg/go:1.19
+      - image: cimg/go:1.21
     steps:
       - checkout
       - restore_cache:
@@ -27,10 +27,10 @@ jobs:
     #- store_test_results:
     #    path: /tmp/test-reports
 
-  build-1-19-u:
+  build-1-21-u:
     working_directory: ~/repo
     docker:
-      - image: cimg/go:1.19
+      - image: cimg/go:1.21
     steps:
       - checkout
       - run:
@@ -53,9 +53,21 @@ jobs:
           command: |
             make deps test
 
+  build-1-19:
+    working_directory: ~/repo
+    docker:
+      - image: cimg/go:1.19
+    steps:
+      - checkout
+      - run:
+          name: Run tests
+          command: |
+            make deps test
+
 workflows:
   pr-build-test:
     jobs:
-      - build-1-19
-      - build-1-19-u
+      - build-1-21
+      - build-1-21-u
       - build-1-20
+      - build-1-19
