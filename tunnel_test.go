@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,7 +19,7 @@ import (
 	"github.com/jhump/grpctunnel/tunnelpb"
 )
 
-func TestTunnelServer(t *testing.T) {
+func TestTunnelServiceHandler(t *testing.T) {
 	// Basic tests of the tunnel service as a gRPC channel
 
 	var svr grpchantesting.TestServer
@@ -143,6 +145,87 @@ func runTests(ctx context.Context, t *testing.T, nested bool, cli tunnelpb.Tunne
 	})
 }
 
+func TestTunnelServiceHandler_Concurrency(t *testing.T) {
+	// Basic tests of the tunnel service as a gRPC channel
+
+	var svr grpchantesting.TestServer
+
+	ts := NewTunnelServiceHandler(TunnelServiceHandlerOptions{})
+	grpchantesting.RegisterTestServiceServer(ts, &svr)
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err, "failed to listen")
+	gs := grpc.NewServer()
+	tunnelpb.RegisterTunnelServiceServer(gs, ts.Service())
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		assert.NoError(t, gs.Serve(l), "error from grpc server")
+	}()
+	defer func() {
+		gs.Stop()
+		<-serveDone
+	}()
+
+	cc, err := grpc.Dial(l.Addr().String(), grpc.WithBlock(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err, "failed top create client")
+	defer func() {
+		err := cc.Close()
+		require.NoError(t, err, "failed to close client conn")
+	}()
+
+	tc, err := tunnelpb.NewTunnelServiceClient(cc).OpenTunnel(context.Background())
+	require.NoError(t, err)
+	ch := NewChannel(tc)
+	defer func() {
+		ch.Close()
+		<-ch.Done()
+		require.NoError(t, ch.Err())
+	}()
+	cli := grpchantesting.NewTestServiceClient(ch)
+
+	done := make(chan struct{})
+	var count int32
+	runOneThread := func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_, err := cli.Unary(context.Background(), &grpchantesting.Message{})
+			require.NoError(t, err)
+			atomic.AddInt32(&count, 1)
+		}
+	}
+
+	// Make sure any goroutines used by the client and server created above have started. That
+	// way, we don't incorrectly think they are leaked goroutines.
+	time.Sleep(500 * time.Millisecond)
+
+	// Ten goroutines all using the same tunnel, hoping to catch data races or
+	// other concurrency-related bugs.
+	checkForGoroutineLeak(t, func() {
+		var wg sync.WaitGroup
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				runOneThread()
+			}()
+		}
+		// all threads sending concurrent requests for 5 seconds
+		time.Sleep(5 * time.Second)
+		close(done)
+		wg.Wait()
+	})
+
+	t.Logf("RPCs sent: %d", atomic.LoadInt32(&count))
+}
+
+// TODO: also need more tests around channel lifecycle, and ensuring it
+// properly respects things like context cancellations, etc
+
 func checkForGoroutineLeak(t *testing.T, fn func()) {
 	before := runtime.NumGoroutine()
 
@@ -163,10 +246,3 @@ func checkForGoroutineLeak(t *testing.T, fn func()) {
 	n := runtime.Stack(buf, true)
 	t.Errorf("%d goroutines leaked:\n%s", after-before, string(buf[:n]))
 }
-
-// TODO: also need more tests around channel lifecycle, and ensuring it
-// properly respects things like context cancellations, etc
-
-// TODO: also need some concurrency checks, to make sure the channel works
-// as expected, and race detector finds no bugs, when used from many
-// goroutines at once

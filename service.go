@@ -117,6 +117,7 @@ func (s *TunnelServiceHandler) openTunnel(stream tunnelpb.TunnelService_OpenTunn
 	if len(s.handlers) == 0 {
 		return status.Error(codes.Unimplemented, "forward tunnels not supported")
 	}
+	stream = &threadSafeOpenTunnelServer{TunnelService_OpenTunnelServer: stream}
 	md, _ := metadata.FromIncomingContext(stream.Context())
 	return serveTunnel(stream, md, s.handlers, s.stopping.Load)
 }

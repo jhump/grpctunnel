@@ -23,12 +23,13 @@ import (
 // implements [grpc.ClientConnInterface], so it can be used to create stubs
 // and issue other RPCs, which are all carried over the given stream.
 func NewChannel(stream tunnelpb.TunnelService_OpenTunnelClient) TunnelChannel {
-	stream = &halfCloseSafeTunnel{TunnelService_OpenTunnelClient: stream}
+	stream = &threadSafeOpenTunnelClient{TunnelService_OpenTunnelClient: stream}
 	md, _ := metadata.FromOutgoingContext(stream.Context())
 	return newTunnelChannel(stream, md, func(*tunnelChannel) { _ = stream.CloseSend() })
 }
 
 func newReverseChannel(stream tunnelpb.TunnelService_OpenReverseTunnelServer, onClose func(*tunnelChannel)) *tunnelChannel {
+	stream = &threadSafeOpenReverseTunnelServer{TunnelService_OpenReverseTunnelServer: stream}
 	md, _ := metadata.FromIncomingContext(stream.Context())
 	return newTunnelChannel(stream, md, onClose)
 }
@@ -69,29 +70,70 @@ type TunnelChannel interface {
 	Err() error
 }
 
-// halfCloseSafeTunnel uses a mutex to prevent races between calls to Send and CloseSend.
-// The underlying stream implementation does not allow these to be called concurrently.
-type halfCloseSafeTunnel struct {
-	mu sync.Mutex
+type threadSafeOpenTunnelClient struct {
+	sendMu sync.Mutex
+	recvMu sync.Mutex
 	tunnelpb.TunnelService_OpenTunnelClient
 }
 
-func (h *halfCloseSafeTunnel) CloseSend() error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+func (h *threadSafeOpenTunnelClient) CloseSend() error {
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
 	return h.TunnelService_OpenTunnelClient.CloseSend()
 }
 
-func (h *halfCloseSafeTunnel) Send(msg *tunnelpb.ClientToServer) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+func (h *threadSafeOpenTunnelClient) Send(msg *tunnelpb.ClientToServer) error {
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
 	return h.TunnelService_OpenTunnelClient.Send(msg)
 }
 
-func (h *halfCloseSafeTunnel) SendMsg(msg interface{}) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+func (h *threadSafeOpenTunnelClient) SendMsg(msg interface{}) error {
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
 	return h.TunnelService_OpenTunnelClient.SendMsg(msg)
+}
+
+func (h *threadSafeOpenTunnelClient) Recv() (*tunnelpb.ServerToClient, error) {
+	h.recvMu.Lock()
+	defer h.recvMu.Unlock()
+	return h.TunnelService_OpenTunnelClient.Recv()
+}
+
+func (h *threadSafeOpenTunnelClient) RecvMsg(msg interface{}) error {
+	h.recvMu.Lock()
+	defer h.recvMu.Unlock()
+	return h.TunnelService_OpenTunnelClient.RecvMsg(msg)
+}
+
+type threadSafeOpenReverseTunnelServer struct {
+	sendMu sync.Mutex
+	recvMu sync.Mutex
+	tunnelpb.TunnelService_OpenReverseTunnelServer
+}
+
+func (h *threadSafeOpenReverseTunnelServer) Send(msg *tunnelpb.ClientToServer) error {
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
+	return h.TunnelService_OpenReverseTunnelServer.Send(msg)
+}
+
+func (h *threadSafeOpenReverseTunnelServer) SendMsg(msg interface{}) error {
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
+	return h.TunnelService_OpenReverseTunnelServer.SendMsg(msg)
+}
+
+func (h *threadSafeOpenReverseTunnelServer) Recv() (*tunnelpb.ServerToClient, error) {
+	h.recvMu.Lock()
+	defer h.recvMu.Unlock()
+	return h.TunnelService_OpenReverseTunnelServer.Recv()
+}
+
+func (h *threadSafeOpenReverseTunnelServer) RecvMsg(msg interface{}) error {
+	h.recvMu.Lock()
+	defer h.recvMu.Unlock()
+	return h.TunnelService_OpenReverseTunnelServer.RecvMsg(msg)
 }
 
 type tunnelChannel struct {
@@ -107,6 +149,8 @@ type tunnelChannel struct {
 	streamCreated bool
 	err           error
 	finished      bool
+
+	streamCreation sync.Mutex
 }
 
 func newTunnelChannel(stream tunnelStreamClient, tunnelMetadata metadata.MD, tearDown func(*tunnelChannel)) *tunnelChannel {
@@ -185,6 +229,12 @@ func (c *tunnelChannel) NewStream(ctx context.Context, desc *grpc.StreamDesc, me
 }
 
 func (c *tunnelChannel) newStream(ctx context.Context, clientStreams, serverStreams bool, methodName string, opts ...grpc.CallOption) (*tunnelClientStream, error) {
+	// this lock is only used here, and orders all calls to newStream sequentially
+	// to make sure streams are created (and NewStream message sent) with IDs in
+	// monotonic order.
+	c.streamCreation.Lock()
+	defer c.streamCreation.Unlock()
+
 	str, md, err := c.allocateStream(ctx, clientStreams, serverStreams, methodName, opts)
 	if err != nil {
 		return nil, err
@@ -219,7 +269,7 @@ func (c *tunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 		return nil, nil, errors.New("channel is closed")
 	}
 
-	if c.lastStreamID == -1 {
+	if c.lastStreamID < 0 {
 		return nil, nil, errors.New("all stream IDs exhausted (must create a new channel)")
 	}
 

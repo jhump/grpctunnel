@@ -85,7 +85,7 @@ func (s *ReverseTunnelServer) Serve(ctx context.Context, opts ...grpc.CallOption
 	if err != nil {
 		return false, err
 	}
-	stream = &halfCloseSafeReverseTunnel{TunnelService_OpenReverseTunnelClient: stream}
+	stream = &threadSafeOpenReverseTunnelClient{TunnelService_OpenReverseTunnelClient: stream}
 	if err := s.addInstance(stream); err != nil {
 		return false, err
 	}
@@ -169,28 +169,71 @@ func (s *ReverseTunnelServer) GracefulStop() {
 	// existing streams to finish
 }
 
-type halfCloseSafeReverseTunnel struct {
+type threadSafeOpenReverseTunnelClient struct {
 	tunnelpb.TunnelService_OpenReverseTunnelClient
-	mu     sync.Mutex
+	sendMu sync.Mutex
 	closed bool
+	recvMu sync.Mutex
 }
 
-func (h *halfCloseSafeReverseTunnel) CloseSend() error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+func (h *threadSafeOpenReverseTunnelClient) CloseSend() error {
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
 	h.closed = true
 	return h.TunnelService_OpenReverseTunnelClient.CloseSend()
 }
 
-func (h *halfCloseSafeReverseTunnel) Send(msg *tunnelpb.ServerToClient) error {
+func (h *threadSafeOpenReverseTunnelClient) Send(msg *tunnelpb.ServerToClient) error {
 	return h.SendMsg(msg)
 }
 
-func (h *halfCloseSafeReverseTunnel) SendMsg(m interface{}) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+func (h *threadSafeOpenReverseTunnelClient) SendMsg(m interface{}) error {
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
 	if h.closed {
 		return io.EOF
 	}
 	return h.TunnelService_OpenReverseTunnelClient.SendMsg(m)
+}
+
+func (h *threadSafeOpenReverseTunnelClient) Recv() (*tunnelpb.ClientToServer, error) {
+	h.recvMu.Lock()
+	defer h.recvMu.Unlock()
+	return h.TunnelService_OpenReverseTunnelClient.Recv()
+}
+
+func (h *threadSafeOpenReverseTunnelClient) RecvMsg(m interface{}) error {
+	h.recvMu.Lock()
+	defer h.recvMu.Unlock()
+	return h.TunnelService_OpenReverseTunnelClient.RecvMsg(m)
+}
+
+type threadSafeOpenTunnelServer struct {
+	sendMu sync.Mutex
+	recvMu sync.Mutex
+	tunnelpb.TunnelService_OpenTunnelServer
+}
+
+func (h *threadSafeOpenTunnelServer) Send(msg *tunnelpb.ServerToClient) error {
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
+	return h.TunnelService_OpenTunnelServer.Send(msg)
+}
+
+func (h *threadSafeOpenTunnelServer) SendMsg(m interface{}) error {
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
+	return h.TunnelService_OpenTunnelServer.SendMsg(m)
+}
+
+func (h *threadSafeOpenTunnelServer) Recv() (*tunnelpb.ClientToServer, error) {
+	h.recvMu.Lock()
+	defer h.recvMu.Unlock()
+	return h.TunnelService_OpenTunnelServer.Recv()
+}
+
+func (h *threadSafeOpenTunnelServer) RecvMsg(m interface{}) error {
+	h.recvMu.Lock()
+	defer h.recvMu.Unlock()
+	return h.TunnelService_OpenTunnelServer.RecvMsg(m)
 }
