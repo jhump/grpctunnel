@@ -1,5 +1,5 @@
 .PHONY: ci
-ci: deps checkgofmt errcheck golint vet predeclared ineffassign staticcheck test
+ci: deps checkgofmt errcheck golint vet ineffassign staticcheck test
 
 .PHONY: deps
 deps:
@@ -36,11 +36,6 @@ staticcheck:
 ineffassign:
 	@go install github.com/gordonklaus/ineffassign@v0.0.0-20200309095847-7953dde2c7bf
 	ineffassign .
-
-.PHONY: predeclared
-predeclared:
-	@go install github.com/nishanths/predeclared@v0.2.2
-	predeclared ./...
 
 .PHONY: golint
 golint:
