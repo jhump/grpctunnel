@@ -53,7 +53,6 @@ test:
 
 .PHONY: generate
 generate:
-	cd proto && buf generate
 	go generate ./...
 
 .PHONY: testcover

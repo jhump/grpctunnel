@@ -353,11 +353,25 @@ func (c *tunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 }
 
 func (c *tunnelChannel) recvLoop() {
+	var count int
 	for {
 		in, err := c.stream.Recv()
 		if err != nil {
 			c.close(err)
 			return
+		}
+		count++
+		if settings, ok := in.Frame.(*tunnelpb.ServerToClient_Settings); ok {
+			if count != 1 {
+
+			}
+			if in.StreamId != -1 {
+
+			}
+			// Ignore settings frames. They indicate a future version of the server.
+			// Server will realize that we ignored it when they see NewStream messages
+			// which will indicate protocol revision zero.
+			continue
 		}
 		str, err := c.getStream(in.StreamId)
 		if err != nil {

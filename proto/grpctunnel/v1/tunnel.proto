@@ -7,6 +7,106 @@ import "google/rpc/status.proto";
 
 option go_package = "github.com/jhump/grpctunnel/tunnelpb";
 
+// A gRPC service which can tunnel gRPC traffic from the client to the server or
+// even the server to the client. A "tunnel" is a gRPC stream which presents
+// itself as a gRPC transport -- over which other streams may be multiplexed.
+//
+// Note that evolution of features in this service relies on the client and
+// server negotiating a "protocol revision". This negotiation step was not
+// originally present, and was added as an optional step in revision zero
+// (revision zero "prime"). Revision one will rely on negotiation, which
+// means that implementations of revision one may not interop correctly with
+// implementations of revision zero. This means that v0.2.0 (which will
+// implement revision zero "prime") MUST be used as an intermediate upgrade
+// step to safely upgrade systems from v0.1.0 of grpctunnel (revision zero)
+// up to the future v0.3.0 (which will implement revision one).
+//
+// The following describes the protocol revisions to date, including
+// upcoming planned revisions.
+//
+// # Revision zero
+// The original revision did not support server-supplied settings or
+// flow-control. This revision CANNOT inter-operate with revision one. If
+// a newer server sends a settings message to a revision zero client, the
+// client will close the tunnel with an error due to the unexpected and
+// unprocessable message.
+//
+// NOTE: This corresponds to v0.1.0 of the grpctunnel module (as well as
+// any prior, unreleased commits).
+//
+// # Revision zero "prime"
+// Revision zero "prime" is the first revision that supports server-supplied
+// settings. A revision zero "prime" server will never send a settings message,
+// but a revision zero "prime" client will accept one (unlike revision zero).
+// This is intended to serve as a bridge between revisions zero and one.
+//
+// In revision zero "prime", it is required that the TunnelService handler
+// implementation immediately send back response headers for both methods.
+// This means that it will be safe for an RPC client using a newer revision
+// (revision one or later) to block for response headers before the tunnel
+// can be used.
+//
+// As of revision zero "prime", clients advertise that they support
+// server-supplied settings by sending a "Grpctunnel-Negotiate" header with
+// a value of "on". So RPC clients calling the OpenTunnel method to create
+// a forward tunnel will include this in request headers. RPC servers
+// handling the OpenReverseTunnel method (and acting as clients) will include
+// this in response headers (which will be immediately sent). This is what
+// tells the server that it can send a settings message as the first message
+// on the tunnel.
+//
+// Similarly, servers advertise that they intend to send server-supplied
+// settings with the same header. So if a client supports settings (and thus
+// sends the header) and also sees it in the server's headers, it knows to
+// await settings before the new tunnel is used.
+//
+// Note that this header exchange mechanism is not sufficient to support a
+// newer client (revision one or later) talking to an older server (revision
+// zero). This is because in revision zero (pre-"prime"), it was not required
+// for the server to immediately send back response headers. So if the client
+// of a forward tunnel blocked for response headers, to decide if a settings
+// frame were coming, it could deadlock if the server used revision zero.
+// Thus revision zero "prime" must be used as a bridge, or an intermediate
+// step, to safely upgrade from revision zero to revision one.
+//
+// NOTE: This corresponds to v0.2.0 of the grpctunnel module.
+//
+// # Revision one
+// Revision one will introduce flow control, which requires the use of
+// server-supplied settings. Flow control is necessary to properly prevent
+// deadlocks in streaming RPCs that could otherwise occur in earlier revisions.
+//
+// Revision one clients will always await headers to decide if they should
+// expect a settings message from the server, before allowing the tunnel to be
+// used. This means that RPC clients calling the OpenTunnel method will block
+// for response headers to decide if they need to subsequently block until
+// server settings are received. RPC servers handling the OpenReverseTunnel
+// method will use the request headers to decide if they need to block for
+// server settings.
+//
+// When a revision one client detects that the server does not support
+// server-supplied settings (no "Grpctunnel-Negotiate" header) or receives
+// server settings that indicate only revision zero is supported, it will
+// advertise all streams as protocol revision zero, not enforce flow
+// control windows, and not send any flow control window updates.
+//
+// When a revision one server receives a NewStream message indicating
+// protocol revision zero, it will not enforce flow control windows for
+// that stream nor will it send flow control window updates for that stream.
+// Like revision zero "prime", if it detects that the client does not support
+// server-supplied settings (no "Grpctunnel-Negotiate" header), it will not
+// send a settings message.
+//
+// NOTE: Revision one is planned but not yet implemented. It will be
+// implemented in a planned v0.3.0 of the grpctunnel module. The above
+// description documents how revision one and zero "prime" can interoperate.
+// At some point, support for revisions zero and zero "prime" may be dropped,
+// and flow-control will be required. (At that point, the requirement for
+// using the "Grpctunnel-Negotiate" header may also be lifted, and server
+// settings would always be sent.) Going forward, there should be no need
+// for another "bridge" revision (i.e. revision one "prime") as the settings
+// exchange mechanism (required as of revision one) should suffice for
+// interop with any future revision.
 service TunnelService {
     // OpenTunnel creates a channel to the server which can be used to send
     // additional RPCs, all of which will be sent to the same server via a
@@ -41,13 +141,15 @@ message ClientToServer {
     // The ID of the stream. Stream IDs must be used in increasing order and
     // cannot be re-used. Unlike in the HTTP/2 protocol, the stream ID is 64-bit
     // so overflow in a long-lived channel is excessively unlikely. (If the
-    // channel were used for a stream every nanosecond, it would take close to
-    // 300 years to exhaust every ID and reach an overflow situation.)
+    // channel were used for a new stream every nanosecond, it would take close
+    // to 300 years to exhaust every ID and reach an overflow situation.)
     int64 stream_id = 1;
 
     oneof frame {
         // Creates a new RPC stream, which includes request header metadata. The
-        // stream ID must not be an already active stream.
+        // stream ID must be greater than all previously-used stream IDs for this
+        // tunnel. It is expected to start at zero for the first stream on the
+        // tunnel and then one for the next, and so on.
         NewStream new_stream = 2;
         // Sends a message on the RPC stream. If the message is larger than 16k,
         // the rest of the message should be sent in chunks using the
@@ -65,6 +167,10 @@ message ClientToServer {
         // (unless the ID is being re-used after the stream is terminated on the
         // server side).
         google.protobuf.Empty cancel = 6;
+        // Lets the peer know that data has been consumed, so it may be able
+        // to send more data, based on flow control window sizes. This is only
+        // used in revision one of the protocol.
+        uint32 window_update = 7;
     }
 }
 
@@ -80,11 +186,23 @@ message ServerToClient {
     // The ID of the stream. Stream IDs are defined by the client and should be
     // used in monotonically increasing order. They cannot be re-used. Unlike
     // HTTP/2, the ID is 64-bit, so overflow/re-use should not be an issue. (If
-    // the channel were used for a stream every nanosecond, it would take close
-    // to 300 years to exhaust every ID and reach an overflow situation.)
+    // the channel were used for a new stream every nanosecond, it would take
+    // close to 300 years to exhaust every ID and reach an overflow situation.)
+    //
+    // The stream ID will be -1 for messages that do not correspond to a single
+    // stream, but to the whole tunnel. Currently, only a Settings message will
+    // be sent this way.
     int64 stream_id = 1;
 
     oneof frame {
+        // This is the very first message sent on a response stream. The tunnel
+        // client should await this before sending any data as it will contain
+        // information about the server's initial flow control window size for
+        // each new stream. This is only used in revision one of the protocol.
+        // A client that needs to interact with an older server (i.e. revision
+        // zero "prime") must examine header metadata to decide if it should
+        // expect a settings message.
+        Settings settings = 6;
         // Sends response headers for this stream. If headers are sent at all,
         // they must be sent before any response message data.
         Metadata response_headers = 2;
@@ -100,19 +218,48 @@ message ServerToClient {
         // given stream ID until the ID is re-used (e.g. a NewStream message is
         // received that creates another stream with the same ID).
         CloseStream close_stream = 5;
+        // Lets the peer know that data has been consumed, so it may be able
+        // to send more data, based on flow control window sizes.
+        uint32 window_update = 7;
     }
 }
 
-message NewStream {
-    string method_name = 1;
-    Metadata request_headers = 2;
+message Settings {
+    // The set of protocol revisions that this server supports. If the
+    // client does not support any of them, it must hang up. This should
+    // never be empty, but if that is observed, the client should assume
+    // the server only supports revision zero.
+    repeated ProtocolRevision supported_protocol_revisions = 1;
 
+    // The server's initial window size for all newly created streams.
+    // When a new stream is created, this is the flow control window for
+    // sending data to the server. The client indicates its own initial
+    // window size, for receiving data from the server, in the NewStream
+    // message.
+    //
+    // This value will be zero if the only supported protocol revision
+    // is zero.
+    uint32 initial_window_size = 2;
+}
+
+message NewStream {
+    // The name of the method being invoked.
+    string method_name = 1;
+    // Header metadata for this request.
+    Metadata request_headers = 2;
+    // The client's initial window size, for receiving data from the
+    // server. This will be zero if protocol_revision is zero.
+    uint32 initial_window_size = 3;
+    // The protocol revision that the client will use for this stream.
+    // If this revision is not supported by the server, the server will
+    // immediately close the stream with an error code.
+    ProtocolRevision protocol_revision = 4;
     // TODO: codec/compressor options?
 }
 
 message MessageData {
     // The full size of the message.
-    int32 size = 1;
+    uint32 size = 1;
     // The message data. This field should not be longer than 16kb (16,384
     // bytes). If the full size of the message is larger then it should be
     // split into multiple chunks. The chunking is done to allow multiple
@@ -133,4 +280,18 @@ message Metadata {
         repeated string val = 1;
     }
     map<string, Values> md = 1;
+}
+
+enum ProtocolRevision {
+    // Indicates revision zero. This is also used by clients and servers that support
+    // revision zero "prime". The difference between zero and zero "prime" is that
+    // zero "prime" clients and servers will send a request or response header named
+    // "Grpctunnel-Negotiate" with a value of "on" (whereas revision zero clients and
+    // servers did not). This advertises optional support to receive server-supplied
+    // settings (which are necessary to revision one and later).
+    REVISION_ZERO = 0;
+    // Indicates revision one, which requires server-supplied settings before the
+    // tunnel can be used and also supports flow control. This flow control support
+    // eliminates chances of deadlock in streaming-heavy tunnel usage.
+    REVISION_ONE = 1;
 }
