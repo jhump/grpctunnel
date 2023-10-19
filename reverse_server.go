@@ -78,8 +78,9 @@ func (s *ReverseTunnelServer) RegisterService(desc *grpc.ServiceDesc, srv interf
 // frames for a stream ID in improper order) or if the stream itself fails (for
 // example, if there is a network disruption or the given context is cancelled).
 //
-// Callers may call this repeatedly, to create multiple, concurrent streams to
-// the gRPC server associated with this reverse tunnel server's associated stub.
+// Callers may call this repeatedly, to create multiple, concurrent tunnels to
+// the gRPC server associated with the stub used to create this reverse tunnel
+// server.
 func (s *ReverseTunnelServer) Serve(ctx context.Context, opts ...grpc.CallOption) (started bool, err error) {
 	stream, err := s.stub.OpenReverseTunnel(ctx, opts...)
 	if err != nil {
