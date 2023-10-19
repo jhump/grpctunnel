@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"reflect"
 	"sync"
 
@@ -362,15 +363,28 @@ func (c *tunnelChannel) recvLoop() {
 		}
 		count++
 		if settings, ok := in.Frame.(*tunnelpb.ServerToClient_Settings); ok {
+			// Process optional settings frame.
 			if count != 1 {
-
+				c.close(fmt.Errorf("protocol error: settings must be first frame (instead was frame #%d)", count))
+				return
 			}
 			if in.StreamId != -1 {
-
+				c.close(fmt.Errorf("protocol error: settings frame had bad stream ID (%d)", in.StreamId))
+				return
 			}
-			// Ignore settings frames. They indicate a future version of the server.
-			// Server will realize that we ignored it when they see NewStream messages
-			// which will indicate protocol revision zero.
+			if len(settings.Settings.SupportedProtocolRevisions) > 0 {
+				var found bool
+				for _, rev := range settings.Settings.SupportedProtocolRevisions {
+					if rev == tunnelpb.ProtocolRevision_REVISION_ZERO {
+						found = true
+						break
+					}
+				}
+				if !found {
+					c.close(fmt.Errorf("protocol error: server does not support revision %d (supported = %v)", tunnelpb.ProtocolRevision_REVISION_ZERO, settings.Settings.SupportedProtocolRevisions))
+					return
+				}
+			}
 			continue
 		}
 		str, err := c.getStream(in.StreamId)
@@ -542,6 +556,9 @@ func (st *tunnelClientStream) SendMsg(m interface{}) error {
 	if err != nil {
 		return err
 	}
+	if int64(len(b)) > math.MaxUint32 {
+		return status.Errorf(codes.ResourceExhausted, "serialized message is too large: %d bytes > maximum %d bytes", len(b), math.MaxUint32)
+	}
 
 	i := 0
 	for {
@@ -559,7 +576,7 @@ func (st *tunnelClientStream) SendMsg(m interface{}) error {
 				StreamId: st.streamID,
 				Frame: &tunnelpb.ClientToServer_RequestMessage{
 					RequestMessage: &tunnelpb.MessageData{
-						Size: int32(len(b)),
+						Size: uint32(len(b)),
 						Data: chunk,
 					},
 				},
@@ -713,6 +730,11 @@ func (st *tunnelClientStream) acceptServerFrame(frame tunnelpb.ServerToClientFra
 		trailers := fromProto(frame.CloseStream.ResponseTrailers)
 		err := status.FromProto(frame.CloseStream.Status).Err()
 		st.finishStream(err, trailers)
+		return
+
+	case *tunnelpb.ServerToClient_WindowUpdate:
+		// We're not enforcing flow control (yet), so ignore window updates.
+		return
 	}
 
 	st.ingestMu.Lock()

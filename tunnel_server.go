@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"sync"
 
@@ -227,6 +228,10 @@ func (st *tunnelServerStream) acceptClientFrame(frame tunnelpb.ClientToServerFra
 	case *tunnelpb.ClientToServer_Cancel:
 		st.finishStream(context.Canceled)
 		return
+
+	case *tunnelpb.ClientToServer_WindowUpdate:
+		// We're not enforcing flow control (yet), so ignore window updates.
+		return
 	}
 
 	st.ingestMu.Lock()
@@ -337,6 +342,9 @@ func (st *tunnelServerStream) SendMsg(m interface{}) error {
 	if err != nil {
 		return err
 	}
+	if int64(len(b)) > math.MaxUint32 {
+		return status.Errorf(codes.ResourceExhausted, "serialized message is too large: %d bytes > maximum %d bytes", len(b), math.MaxUint32)
+	}
 
 	i := 0
 	for {
@@ -354,7 +362,7 @@ func (st *tunnelServerStream) SendMsg(m interface{}) error {
 				StreamId: st.streamID,
 				Frame: &tunnelpb.ServerToClient_ResponseMessage{
 					ResponseMessage: &tunnelpb.MessageData{
-						Size: int32(len(b)),
+						Size: uint32(len(b)),
 						Data: chunk,
 					},
 				},
