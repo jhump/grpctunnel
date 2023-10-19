@@ -33,7 +33,7 @@ func main() {
 			return vals[0]
 		},
 	})
-	tunnelpb.RegisterTunnelServiceServer(svr, tunnelSvc)
+	tunnelpb.RegisterTunnelServiceServer(svr, tunnelSvc.Service())
 	gen.RegisterTunnelTestServiceServer(svr, &tunnelTester{tunnelSvc: tunnelSvc})
 
 	// Over the tunnel, we just expose this simple test service

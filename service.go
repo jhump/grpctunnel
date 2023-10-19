@@ -26,8 +26,6 @@ import (
 //
 // See NewTunnelServiceHandler.
 type TunnelServiceHandler struct {
-	tunnelpb.UnimplementedTunnelServiceServer
-
 	handlers                  grpchan.HandlerMap
 	noReverseTunnels          bool
 	onReverseTunnelConnect    func(TunnelChannel)
@@ -96,6 +94,14 @@ func (s *TunnelServiceHandler) RegisterService(desc *grpc.ServiceDesc, srv inter
 	s.handlers.RegisterService(desc, srv)
 }
 
+// Service returns the actual tunnel service implementation to register with a
+// [grpc.ServiceRegistrar].
+func (s *TunnelServiceHandler) Service() tunnelpb.TunnelServiceServer {
+	return &tunnelServiceHandler{
+		h: s,
+	}
+}
+
 // InitiateShutdown starts the graceful shutdown process and returns
 // immediately. This should be called when the server wants to shut down. This
 // complements the normal process initiated by calling the GracefulStop method
@@ -107,10 +113,10 @@ func (s *TunnelServiceHandler) InitiateShutdown() {
 	s.stopping.Store(true)
 }
 
-// OpenTunnel creates a forward tunnel from the RPC client to this server. Any
+// openTunnel creates a forward tunnel from the RPC client to this server. Any
 // services registered with this handler will be accessible to RPCs issued over
 // the tunnel.
-func (s *TunnelServiceHandler) OpenTunnel(stream tunnelpb.TunnelService_OpenTunnelServer) error {
+func (s *TunnelServiceHandler) openTunnel(stream tunnelpb.TunnelService_OpenTunnelServer) error {
 	if len(s.handlers) == 0 {
 		return status.Error(codes.Unimplemented, "forward tunnels not supported")
 	}
@@ -126,12 +132,12 @@ func (s *TunnelServiceHandler) OpenTunnel(stream tunnelpb.TunnelService_OpenTunn
 	return serveTunnel(stream, md, s.handlers, s.stopping.Load)
 }
 
-// OpenReverseTunnel creates a reverse tunnel from this server to the RPC client.
+// openReverseTunnel creates a reverse tunnel from this server to the RPC client.
 // This handler can be used as an RPC client connection, via AsChannel and
 // KeyAsChannel, to send RPCs to the client on the other end of the reverse
 // tunnel. The RPC client acts as the server and uses NewReverseTunnelServer to
 // create a server and register exposed RPC services with it.
-func (s *TunnelServiceHandler) OpenReverseTunnel(stream tunnelpb.TunnelService_OpenReverseTunnelServer) error {
+func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_OpenReverseTunnelServer) error {
 	if s.noReverseTunnels {
 		return status.Error(codes.Unimplemented, "reverse tunnels not supported")
 	}
@@ -181,6 +187,19 @@ func (s *TunnelServiceHandler) unregister(ch *tunnelChannel) {
 	if rc != nil {
 		rc.remove(ch)
 	}
+}
+
+type tunnelServiceHandler struct {
+	tunnelpb.UnimplementedTunnelServiceServer
+	h *TunnelServiceHandler
+}
+
+func (s *tunnelServiceHandler) OpenTunnel(stream tunnelpb.TunnelService_OpenTunnelServer) error {
+	return s.h.openTunnel(stream)
+}
+
+func (s *tunnelServiceHandler) OpenReverseTunnel(stream tunnelpb.TunnelService_OpenReverseTunnelServer) error {
+	return s.h.openReverseTunnel(stream)
 }
 
 type reverseChannels struct {

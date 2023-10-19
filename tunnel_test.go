@@ -37,12 +37,12 @@ func TestTunnelServiceHandler(t *testing.T) {
 	grpchantesting.RegisterTestServiceServer(ts, &svr)
 	// recursive: tunnels can be run on top of tunnels
 	// (not realistic, but fun exercise to verify soundness of protocol)
-	tunnelpb.RegisterTunnelServiceServer(ts, ts)
+	tunnelpb.RegisterTunnelServiceServer(ts, ts.Service())
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err, "failed to listen")
 	gs := grpc.NewServer()
-	tunnelpb.RegisterTunnelServiceServer(gs, ts)
+	tunnelpb.RegisterTunnelServiceServer(gs, ts.Service())
 	serveDone := make(chan struct{})
 	go func() {
 		defer close(serveDone)
@@ -104,7 +104,7 @@ func runTests(ctx context.Context, t *testing.T, nested bool, cli tunnelpb.Tunne
 			revSvr := NewReverseTunnelServer(cli)
 			if !nested {
 				// we need this to run the nested/recursive tunnel test
-				tunnelpb.RegisterTunnelServiceServer(revSvr, ts)
+				tunnelpb.RegisterTunnelServiceServer(revSvr, ts.Service())
 			}
 			grpchantesting.RegisterTestServiceServer(revSvr, testSvr)
 			serveDone := make(chan struct{})
@@ -156,7 +156,7 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err, "failed to listen")
 	gs := grpc.NewServer()
-	tunnelpb.RegisterTunnelServiceServer(gs, ts)
+	tunnelpb.RegisterTunnelServiceServer(gs, ts.Service())
 	serveDone := make(chan struct{})
 	go func() {
 		defer close(serveDone)
