@@ -41,12 +41,11 @@ func main() {
 
 	// First check the forward tunnel.
 	tunnelClient := tunnelpb.NewTunnelServiceClient(cc)
-	tc, err := tunnelClient.OpenTunnel(ctx)
+	tunnel, err := grpctunnel.NewChannel(ctx, tunnelClient)
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Println("Tunnel created.")
-	tunnel := grpctunnel.NewChannel(tc)
 	defer tunnel.Close()
 	var clCounts atomic.Int32
 	if err := internal.SendRPCs(ctx, grpchantesting.NewTestServiceClient(withClientCounts(tunnel, &clCounts))); err != nil {

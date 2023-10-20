@@ -82,6 +82,7 @@ func (s *ReverseTunnelServer) RegisterService(desc *grpc.ServiceDesc, srv interf
 // the gRPC server associated with the stub used to create this reverse tunnel
 // server.
 func (s *ReverseTunnelServer) Serve(ctx context.Context, opts ...grpc.CallOption) (started bool, err error) {
+	ctx = metadata.AppendToOutgoingContext(ctx, grpctunnelNegotiateKey, grpctunnelNegotiateVal)
 	stream, err := s.stub.OpenReverseTunnel(ctx, opts...)
 	if err != nil {
 		return false, err

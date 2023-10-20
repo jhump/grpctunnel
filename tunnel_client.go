@@ -22,11 +22,19 @@ import (
 
 // NewChannel creates a new channel for issues RPCs. The returned channel
 // implements [grpc.ClientConnInterface], so it can be used to create stubs
-// and issue other RPCs, which are all carried over the given stream.
-func NewChannel(stream tunnelpb.TunnelService_OpenTunnelClient) TunnelChannel {
+// and issue other RPCs, which are all carried over a single tunnel stream
+// opened using the given stub. The given context defines the lifetime of
+// the stream and therefore of the channel; if the context times out or is
+// cancelled, the channel will be closed.
+func NewChannel(ctx context.Context, stub tunnelpb.TunnelServiceClient, opts ...grpc.CallOption) (TunnelChannel, error) {
+	ctx = metadata.AppendToOutgoingContext(ctx, grpctunnelNegotiateKey, grpctunnelNegotiateVal)
+	stream, err := stub.OpenTunnel(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
 	stream = &threadSafeOpenTunnelClient{TunnelService_OpenTunnelClient: stream}
 	md, _ := metadata.FromOutgoingContext(stream.Context())
-	return newTunnelChannel(stream, md, func(*tunnelChannel) { _ = stream.CloseSend() })
+	return newTunnelChannel(stream, md, func(*tunnelChannel) { _ = stream.CloseSend() }), nil
 }
 
 func newReverseChannel(stream tunnelpb.TunnelService_OpenReverseTunnelServer, onClose func(*tunnelChannel)) *tunnelChannel {
