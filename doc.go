@@ -13,14 +13,11 @@
 // Forward tunnels allow a client to pin RPCs to a single server since they are
 // all sent over a single stream. Forward tunnels work like so:
 //
-//   - Client issues an RPC that establishes the forward tunnel. The RPC is a
-//     full-duplex bidirectional stream, so can support all manner of streaming
-//     RPCs over the tunnel.
-//   - Client then uses the tunnel to create a new gRPC client connection. (See
-//     NewChannel).
-//   - RPC stubs can then be created using this new connection. All RPCs issued
-//     on this connection are transmitted over the tunnel, on the stream that was
-//     established in step 1.
+//   - Client creates a new tunnel by calling NewChannel. This issues an RPC that
+//     establishes the forward tunnel. The RPC is a full-duplex bidirectional
+//     stream, so can support all manner of streaming RPCs over the tunnel.
+//   - RPC stubs can then be created using this tunnel. All RPCs issued on it are
+//     transmitted over the stream that was established by the RPC mentioned above.
 //   - Closing the tunnel channel also results in the underlying stream
 //     being closed.
 //

@@ -285,10 +285,11 @@ message Metadata {
 enum ProtocolRevision {
     // Indicates revision zero. This is also used by clients and servers that support
     // revision zero "prime". The difference between zero and zero "prime" is that
-    // zero "prime" clients and servers will send a request or response header named
+    // zero "prime" clients and servers will send a request and response header named
     // "Grpctunnel-Negotiate" with a value of "on" (whereas revision zero clients and
     // servers did not). This advertises optional support to receive server-supplied
-    // settings (which are necessary to revision one and later).
+    // settings. These headers are necessary to correctly interop with clients and
+    // servers that implement revision one and later.
     REVISION_ZERO = 0;
     // Indicates revision one, which requires server-supplied settings before the
     // tunnel can be used and also supports flow control. This flow control support
