@@ -1,9 +1,11 @@
 package grpctunnel
 
+//lint:file-ignore U1000 these aren't actually unused, but staticcheck is having trouble
+//                       determining that, likely due to the use of generics
+
 import (
 	"container/list"
 	"context"
-	"errors"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -17,7 +19,7 @@ const (
 	chunkMax          = 16384
 )
 
-var errFlowControlWindowExceeded = errors.New("flow control window exceeded")
+var errFlowControlWindowExceeded = status.Errorf(codes.ResourceExhausted, "flow control window exceeded")
 
 // sender is responsible for sending messages and managing flow control.
 type sender interface {

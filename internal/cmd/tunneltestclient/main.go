@@ -24,7 +24,16 @@ import (
 
 func main() {
 	serverPort := flag.Int("server-port", 26354, "the port on which the server is listening")
+	noFlowControl := flag.Bool("no-flow-control", false, "disables flow control")
+	tunnelType := flag.String("tunnel-type", "both", `type of tunnel to test, can be "forward", "reverse", or "both"`)
 	flag.Parse()
+
+	switch *tunnelType {
+	case "forward", "reverse", "both":
+		// okay
+	default:
+		log.Fatalf(`tunnel type %q is not valid; must be one of "forward", "reverse", or "both"`, *tunnelType)
+	}
 
 	ctx := context.Background()
 	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -39,49 +48,58 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// First check the forward tunnel.
 	tunnelClient := tunnelpb.NewTunnelServiceClient(cc)
-	tunnel, err := grpctunnel.NewChannel(ctx, tunnelClient)
-	if err != nil {
-		log.Fatal(err)
+	var tunnelOpts []grpctunnel.TunnelOption
+	if *noFlowControl {
+		tunnelOpts = []grpctunnel.TunnelOption{grpctunnel.WithDisableFlowControl()}
 	}
-	log.Println("Tunnel created.")
-	defer tunnel.Close()
-	var clCounts atomic.Int32
-	if err := internal.SendRPCs(ctx, grpchantesting.NewTestServiceClient(withClientCounts(tunnel, &clCounts))); err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("Issued %d requests over tunnel.", clCounts.Load())
 
-	// Then check the reverse tunnel.
-	key, err := makeClientKey()
-	if err != nil {
-		log.Fatal(err)
-	}
-	reverseTunnel := grpctunnel.NewReverseTunnelServer(tunnelClient)
-	// Over the tunnel, we just expose this simple test service
-	var svrCounts atomic.Int32
-	grpchantesting.RegisterTestServiceServer(withServerCounts(reverseTunnel, &svrCounts), &grpchantesting.TestServer{})
-	ctx, cancel = context.WithCancel(ctx)
-	done := make(chan struct{})
-	defer func() {
-		cancel()
-		<-done
-	}()
-	go func() {
-		defer close(done)
-		ctx := metadata.AppendToOutgoingContext(ctx, "test-client-key", key)
-		if started, err := reverseTunnel.Serve(ctx); !started {
+	// First check the forward tunnel.
+	if *tunnelType != "reverse" {
+		tunnel, err := grpctunnel.NewChannel(tunnelClient, tunnelOpts...).Start(ctx)
+		if err != nil {
 			log.Fatal(err)
 		}
-	}()
-	log.Printf("Reverse tunnel started (key = %s).", key)
-	// This tells the server to initiate RPCs via
-	tester := gen.NewTunnelTestServiceClient(cc)
-	if _, err := tester.TriggerTestRPCs(ctx, &gen.TriggerTestRPCsRequest{ClientKey: key}); err != nil {
-		log.Fatal(err)
+		log.Println("Tunnel created.")
+		defer tunnel.Close()
+		var clCounts atomic.Int32
+		if err := internal.SendRPCs(ctx, grpchantesting.NewTestServiceClient(withClientCounts(tunnel, &clCounts))); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("Issued %d requests over tunnel.", clCounts.Load())
 	}
-	log.Printf("Served %d requests over reverse tunnel.", svrCounts.Load())
+
+	// Then check the reverse tunnel.
+	if *tunnelType != "forward" {
+		key, err := makeClientKey()
+		if err != nil {
+			log.Fatal(err)
+		}
+		reverseTunnel := grpctunnel.NewReverseTunnelServer(tunnelClient, tunnelOpts...)
+		// Over the tunnel, we just expose this simple test service
+		var svrCounts atomic.Int32
+		grpchantesting.RegisterTestServiceServer(withServerCounts(reverseTunnel, &svrCounts), &grpchantesting.TestServer{})
+		ctx, cancel = context.WithCancel(ctx)
+		done := make(chan struct{})
+		defer func() {
+			cancel()
+			<-done
+		}()
+		go func() {
+			defer close(done)
+			ctx := metadata.AppendToOutgoingContext(ctx, "test-client-key", key)
+			if started, err := reverseTunnel.Serve(ctx); !started {
+				log.Fatal(err)
+			}
+		}()
+		log.Printf("Reverse tunnel started (key = %s).", key)
+		// This tells the server to initiate RPCs via
+		tester := gen.NewTunnelTestServiceClient(cc)
+		if _, err := tester.TriggerTestRPCs(ctx, &gen.TriggerTestRPCsRequest{ClientKey: key}); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("Served %d requests over reverse tunnel.", svrCounts.Load())
+	}
 
 	// Success!
 }

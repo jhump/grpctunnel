@@ -21,15 +21,36 @@ import (
 	"github.com/jhump/grpctunnel/tunnelpb"
 )
 
-// NewChannel creates a new channel for issues RPCs. The returned channel
-// implements [grpc.ClientConnInterface], so it can be used to create stubs
-// and issue other RPCs, which are all carried over a single tunnel stream
-// opened using the given stub. The given context defines the lifetime of
-// the stream and therefore of the channel; if the context times out or is
-// cancelled, the channel will be closed.
-func NewChannel(ctx context.Context, stub tunnelpb.TunnelServiceClient, opts ...grpc.CallOption) (TunnelChannel, error) {
+// NewChannel creates a new pending channel that, once started, can be used
+// for issuing RPCs.
+func NewChannel(stub tunnelpb.TunnelServiceClient, opts ...TunnelOption) PendingChannel {
+	p := &pendingChannel{stub: stub}
+	for _, opt := range opts {
+		opt.apply(&p.opts)
+	}
+	return p
+}
+
+// PendingChannel is an un-started channel. Calling Start will establish the
+// tunnel and returns a value that implements [grpc.ClientConnInterface], so it
+// can be used to create stubs and issue other RPCs that are all carried over a
+// single tunnel stream.
+//
+// The given context defines the lifetime of the stream and therefore of the
+// channel; if the context times out or is cancelled, the channel will be closed.
+type PendingChannel interface {
+	Start(ctx context.Context, opts ...grpc.CallOption) (TunnelChannel, error)
+}
+
+type pendingChannel struct {
+	stub tunnelpb.TunnelServiceClient
+	opts tunnelOpts
+}
+
+func (p *pendingChannel) Start(ctx context.Context, opts ...grpc.CallOption) (TunnelChannel, error) {
+	// TODO: validate options and maybe return an error
 	ctx = metadata.AppendToOutgoingContext(ctx, grpctunnelNegotiateKey, grpctunnelNegotiateVal)
-	stream, err := stub.OpenTunnel(ctx, opts...)
+	stream, err := p.stub.OpenTunnel(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -41,21 +62,15 @@ func NewChannel(ctx context.Context, stub tunnelpb.TunnelServiceClient, opts ...
 	serverSendsSettings := len(vals) > 0 && vals[0] == grpctunnelNegotiateVal
 	reqMD, _ := metadata.FromOutgoingContext(stream.Context())
 	stream = &threadSafeOpenTunnelClient{TunnelService_OpenTunnelClient: stream}
-	return newTunnelChannel(stream, reqMD, serverSendsSettings, func(*tunnelChannel) { _ = stream.CloseSend() }), nil
+	return newTunnelChannel(stream, reqMD, serverSendsSettings, &p.opts, func(*tunnelChannel) { _ = stream.CloseSend() }), nil
 }
 
-func newReverseChannel(stream tunnelpb.TunnelService_OpenReverseTunnelServer, onClose func(*tunnelChannel)) *tunnelChannel {
+func newReverseChannel(stream tunnelpb.TunnelService_OpenReverseTunnelServer, opts *tunnelOpts, onClose func(*tunnelChannel)) *tunnelChannel {
 	md, _ := metadata.FromIncomingContext(stream.Context())
 	vals := md.Get(grpctunnelNegotiateKey)
 	serverSendsSettings := len(vals) > 0 && vals[0] == grpctunnelNegotiateVal
 	stream = &threadSafeOpenReverseTunnelServer{TunnelService_OpenReverseTunnelServer: stream}
-	return newTunnelChannel(stream, md, serverSendsSettings, onClose)
-}
-
-type tunnelStreamClient interface {
-	Context() context.Context
-	Send(*tunnelpb.ClientToServer) error
-	Recv() (*tunnelpb.ServerToClient, error)
+	return newTunnelChannel(stream, md, serverSendsSettings, opts, onClose)
 }
 
 // TunnelChannel is a special gRPC connection that uses a gRPC stream (a tunnel)
@@ -86,6 +101,12 @@ type TunnelChannel interface {
 	// Err returns the error that caused the channel to close. If the channel
 	// is not yet closed, this will return nil.
 	Err() error
+}
+
+type tunnelStreamClient interface {
+	Context() context.Context
+	Send(*tunnelpb.ClientToServer) error
+	Recv() (*tunnelpb.ServerToClient, error)
 }
 
 type threadSafeOpenTunnelClient struct {
@@ -158,6 +179,7 @@ type tunnelChannel struct {
 	stream              tunnelStreamClient
 	tunnelMetadata      metadata.MD
 	serverSendsSettings bool
+	tunnelOpts          *tunnelOpts
 	ctx                 context.Context
 	cancel              context.CancelFunc
 	tearDown            func(*tunnelChannel)
@@ -176,12 +198,13 @@ type tunnelChannel struct {
 	streamCreation sync.Mutex
 }
 
-func newTunnelChannel(stream tunnelStreamClient, tunnelMetadata metadata.MD, serverSendsSettings bool, tearDown func(*tunnelChannel)) *tunnelChannel {
+func newTunnelChannel(stream tunnelStreamClient, tunnelMetadata metadata.MD, serverSendsSettings bool, opts *tunnelOpts, tearDown func(*tunnelChannel)) *tunnelChannel {
 	ctx, cancel := context.WithCancel(stream.Context())
 	c := &tunnelChannel{
 		stream:              stream,
 		tunnelMetadata:      tunnelMetadata,
 		serverSendsSettings: serverSendsSettings,
+		tunnelOpts:          opts,
 		ctx:                 ctx,
 		cancel:              cancel,
 		tearDown:            tearDown,
@@ -454,20 +477,21 @@ func (c *tunnelChannel) recvLoop() {
 			c.close(fmt.Errorf("protocol error: first frame was not settings (instead was %T)", in.Frame))
 			return
 		}
-		var valid bool
+		supportedRevisions := c.tunnelOpts.supportedRevisions()
+		var supported bool
 		for _, rev := range settings.Settings.SupportedProtocolRevisions {
-			switch rev {
-			case tunnelpb.ProtocolRevision_REVISION_ZERO, tunnelpb.ProtocolRevision_REVISION_ONE:
+			switch {
+			case inSlice(rev, supportedRevisions):
 				if rev > c.useRevision {
 					// use highest version that both server and client supports
 					c.useRevision = rev
 				}
-				valid = true
+				supported = true
 			}
 		}
-		if !valid {
-			c.close(fmt.Errorf("protocol error: server does not support revision %s or %s (supported = %v)",
-				tunnelpb.ProtocolRevision_REVISION_ZERO, tunnelpb.ProtocolRevision_REVISION_ONE, settings.Settings.SupportedProtocolRevisions))
+		if !supported {
+			c.close(fmt.Errorf("protocol error: server support revisions %v, but client supports revisions %v",
+				settings.Settings.SupportedProtocolRevisions, supportedRevisions))
 			return
 		}
 		c.settings = settings.Settings
@@ -488,6 +512,15 @@ func (c *tunnelChannel) recvLoop() {
 		}
 		str.acceptServerFrame(in.Frame)
 	}
+}
+
+func inSlice[S ~[]T, T comparable](find T, slice S) bool {
+	for _, elem := range slice {
+		if elem == find {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *tunnelChannel) getStream(streamID int64) (*tunnelClientStream, error) {

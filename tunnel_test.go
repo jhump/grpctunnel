@@ -150,8 +150,9 @@ func runTests(
 
 	t.Run(prefix+"forward", func(t *testing.T) {
 		checkForGoroutineLeak(t, func() {
-			ch, err := NewChannel(ctx, cl)
+			ch, err := NewChannel(cl).Start(ctx)
 			require.NoError(t, err, "failed to open tunnel")
+
 			defer func() {
 				ch.Close()
 				<-ch.Done()
@@ -302,7 +303,7 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 	}()
 
 	tunnelCli := tunnelpb.NewTunnelServiceClient(cc)
-	ch, err := NewChannel(context.Background(), tunnelCli)
+	ch, err := NewChannel(tunnelCli).Start(context.Background())
 	require.NoError(t, err)
 	defer func() {
 		ch.Close()

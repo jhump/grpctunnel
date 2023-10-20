@@ -22,11 +22,12 @@ import (
 	"github.com/jhump/grpctunnel/tunnelpb"
 )
 
-func serveTunnel(stream tunnelStreamServer, tunnelMetadata metadata.MD, clientAcceptsSettings bool, handlers grpchan.HandlerMap, isClosing func() bool) error {
+func serveTunnel(stream tunnelStreamServer, tunnelMetadata metadata.MD, clientAcceptsSettings bool, opts *tunnelOpts, handlers grpchan.HandlerMap, isClosing func() bool) error {
 	svr := &tunnelServer{
 		stream:                stream,
 		services:              handlers,
 		clientAcceptsSettings: clientAcceptsSettings,
+		tunnelOpts:            opts,
 		isClosing:             isClosing,
 		streams:               map[int64]*tunnelServerStream{},
 		lastSeen:              -1,
@@ -44,6 +45,7 @@ type tunnelServer struct {
 	stream                tunnelStreamServer
 	services              grpchan.HandlerMap
 	clientAcceptsSettings bool
+	tunnelOpts            *tunnelOpts
 	isClosing             func() bool
 
 	mu       sync.RWMutex
@@ -58,10 +60,8 @@ func (s *tunnelServer) serve(tunnelMetadata metadata.MD) error {
 				StreamId: -1,
 				Frame: &tunnelpb.ServerToClient_Settings{
 					Settings: &tunnelpb.Settings{
-						InitialWindowSize: initialWindowSize,
-						SupportedProtocolRevisions: []tunnelpb.ProtocolRevision{
-							tunnelpb.ProtocolRevision_REVISION_ZERO, tunnelpb.ProtocolRevision_REVISION_ONE,
-						},
+						InitialWindowSize:          initialWindowSize,
+						SupportedProtocolRevisions: s.tunnelOpts.supportedRevisions(),
 					},
 				},
 			})

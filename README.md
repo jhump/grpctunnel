@@ -147,7 +147,7 @@ if err != nil {
 
 tunnelStub := tunnelpb.NewTunnelServiceClient(cc)
 // Opens a tunnel and return a channel.
-ch, err := grpctunnel.NewChannel(context.Background(), tunnelStub)
+ch, err := grpctunnel.NewChannel(tunnelStub).Start(context.Background())
 if err != nil {
 	log.Fatal(err)
 }
@@ -158,7 +158,7 @@ if err != nil {
 To close the tunnel, use the channel's `Close` method. This will also close the
 underlying stream. If any RPCs are in progress on the channel when it is closed,
 they will be cancelled. The channel is also closed if the context passed to
-`NewChannel` is cancelled or times out.
+`Start` is cancelled or times out.
 
 To use client interceptors with these channels, wrap them using
 [`grpchan.InterceptClientConn`](https://pkg.go.dev/github.com/fullstorydev/grpchan#InterceptClientConn)
