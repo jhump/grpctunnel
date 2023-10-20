@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+service TunnelTestService {
+  // This is invoked on a server after a client establishes a reverse tunnel.
+  // This will use the reverse tunnel to send a bunch of RPCs, from the server
+  // to the client, and then return when finished.
+  rpc TriggerTestRPCs(TriggerTestRPCsRequest) returns (TriggerTestRPCsResponse);
+}
+
+message TriggerTestRPCsRequest {
+  string client_key = 1;
+}
+
+message TriggerTestRPCsResponse {
+}
