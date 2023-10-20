@@ -14,6 +14,11 @@ import (
 	"github.com/jhump/grpctunnel/tunnelpb"
 )
 
+const (
+	grpctunnelNegotiateKey = "grpctunnel-negotiate"
+	grpctunnelNegotiateVal = "on"
+)
+
 // TunnelServiceHandler provides an implementation for TunnelServiceServer. You
 // can register handlers with it, and it will then expose those handlers for
 // incoming tunnels. If no handlers are registered, the server will reply to
@@ -125,11 +130,13 @@ func (s *TunnelServiceHandler) openTunnel(stream tunnelpb.TunnelService_OpenTunn
 	// This gives any server interceptors a chance to run and potentially to send
 	// auth credentials in response headers (since the client will need a way to
 	// authenticate the server, since roles are reversed with reverse tunnels).
-	_ = stream.SendHeader(nil)
+	_ = stream.SendHeader(metadata.Pairs(grpctunnelNegotiateKey, grpctunnelNegotiateVal))
 
-	stream = &threadSafeOpenTunnelServer{TunnelService_OpenTunnelServer: stream}
 	md, _ := metadata.FromIncomingContext(stream.Context())
-	return serveTunnel(stream, md, s.handlers, s.stopping.Load)
+	vals := md.Get(grpctunnelNegotiateKey)
+	clientAcceptsSettings := len(vals) > 0 && vals[0] == grpctunnelNegotiateVal
+	stream = &threadSafeOpenTunnelServer{TunnelService_OpenTunnelServer: stream}
+	return serveTunnel(stream, md, clientAcceptsSettings, s.handlers, s.stopping.Load)
 }
 
 // openReverseTunnel creates a reverse tunnel from this server to the RPC client.
@@ -146,7 +153,7 @@ func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_O
 	// This gives any server interceptors a chance to run and potentially to send
 	// auth credentials in response headers (since the client will need a way to
 	// authenticate the server, since roles are reversed with reverse tunnels).
-	_ = stream.SendHeader(nil)
+	_ = stream.SendHeader(metadata.Pairs(grpctunnelNegotiateKey, grpctunnelNegotiateVal))
 
 	ch := newReverseChannel(stream, s.unregister)
 	defer ch.Close()

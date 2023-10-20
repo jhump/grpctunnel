@@ -1,6 +1,7 @@
 package grpctunnel
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"runtime"
@@ -12,6 +13,7 @@ import (
 	"github.com/fullstorydev/grpchan/grpchantesting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -66,43 +68,112 @@ func TestTunnelServiceHandler(t *testing.T) {
 	// way, we don't incorrectly think they are leaked goroutines.
 	time.Sleep(500 * time.Millisecond)
 
-	runTests(context.Background(), t, false, cli, ts, &svr)
+	runTests(context.Background(), t, modeRunNested, cli, ts, &svr,
+		func(_ context.Context, t *testing.T, ch grpc.ClientConnInterface) {
+			grpchantesting.RunChannelTestCases(t, ch, true)
+		})
 }
 
-func runTests(ctx context.Context, t *testing.T, nested bool, cli tunnelpb.TunnelServiceClient, ts *TunnelServiceHandler, testSvr *grpchantesting.TestServer) {
-	if nested {
+func TestTunnelServiceHandler_Deadlocks(t *testing.T) {
+	var svr grpchantesting.TestServer
+
+	ts := NewTunnelServiceHandler(TunnelServiceHandlerOptions{
+		AffinityKey: func(t TunnelChannel) any {
+			md, _ := metadata.FromIncomingContext(t.Context())
+			vals := md.Get("nesting-level")
+			if len(vals) == 0 {
+				return ""
+			}
+			return vals[0]
+		},
+	})
+	grpchantesting.RegisterTestServiceServer(ts, &svr)
+	// recursive: tunnels can be run on top of tunnels
+	// (not realistic, but fun exercise to verify soundness of protocol)
+	tunnelpb.RegisterTunnelServiceServer(ts, ts.Service())
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err, "failed to listen")
+	gs := grpc.NewServer()
+	tunnelpb.RegisterTunnelServiceServer(gs, ts.Service())
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		assert.NoError(t, gs.Serve(l), "error from grpc server")
+	}()
+	defer func() {
+		gs.Stop()
+		<-serveDone
+	}()
+
+	cc, err := grpc.Dial(l.Addr().String(), grpc.WithBlock(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err, "failed top create client")
+	defer func() {
+		err := cc.Close()
+		require.NoError(t, err, "failed to close client conn")
+	}()
+
+	cli := tunnelpb.NewTunnelServiceClient(cc)
+
+	// Make sure any goroutines used by the client and server created above have started. That
+	// way, we don't incorrectly think they are leaked goroutines.
+	time.Sleep(500 * time.Millisecond)
+
+	runTests(context.Background(), t, modeRunNested, cli, ts, &svr,
+		func(ctx context.Context, t *testing.T, ch grpc.ClientConnInterface) {
+			runDeadlockTests(ctx, t, ch)
+		})
+}
+
+type nestingMode int
+
+const (
+	modeDoNotRunNested = nestingMode(iota)
+	modeRunNested
+	modeIsNested
+)
+
+func runTests(
+	ctx context.Context,
+	t *testing.T,
+	mode nestingMode,
+	cl tunnelpb.TunnelServiceClient,
+	ts *TunnelServiceHandler,
+	testSvr *grpchantesting.TestServer,
+	testFunc func(ctx context.Context, t *testing.T, ch grpc.ClientConnInterface),
+) {
+	prefix := ""
+	if mode == modeIsNested {
+		prefix = "nested-"
 		ctx = metadata.AppendToOutgoingContext(ctx, "nesting-level", "1")
 	}
 
-	prefix := ""
-	if nested {
-		prefix = "nested-"
-	}
 	t.Run(prefix+"forward", func(t *testing.T) {
 		checkForGoroutineLeak(t, func() {
-			tunnel, err := cli.OpenTunnel(ctx)
+			ch, err := NewChannel(ctx, cl)
 			require.NoError(t, err, "failed to open tunnel")
-
-			ch := NewChannel(tunnel)
 			defer func() {
 				ch.Close()
 				<-ch.Done()
 				assert.NoError(t, ch.Err(), "channel ended with error")
 			}()
 
-			grpchantesting.RunChannelTestCases(t, ch, true)
+			testFunc(ctx, t, ch)
 
-			if !nested {
+			if mode == modeRunNested {
 				// nested/recursive test
-				runTests(ch.Context(), t, true, tunnelpb.NewTunnelServiceClient(ch), ts, testSvr)
+				runTests(ch.Context(), t, modeIsNested,
+					tunnelpb.NewTunnelServiceClient(ch),
+					ts, testSvr, testFunc,
+				)
 			}
 		})
 	})
 
 	t.Run(prefix+"reverse", func(t *testing.T) {
 		checkForGoroutineLeak(t, func() {
-			revSvr := NewReverseTunnelServer(cli)
-			if !nested {
+			revSvr := NewReverseTunnelServer(cl)
+			if mode == modeRunNested {
 				// we need this to run the nested/recursive tunnel test
 				tunnelpb.RegisterTunnelServiceServer(revSvr, ts.Service())
 			}
@@ -121,7 +192,7 @@ func runTests(ctx context.Context, t *testing.T, nested bool, cli tunnelpb.Tunne
 
 			// make sure server has registered client, so we can issue RPCs to it
 			var ch ReverseClientConnInterface
-			if nested {
+			if mode == modeIsNested {
 				ch = ts.KeyAsChannel("1")
 			} else {
 				ch = ts.AsChannel()
@@ -131,11 +202,15 @@ func runTests(ctx context.Context, t *testing.T, nested bool, cli tunnelpb.Tunne
 			err := ch.WaitForReady(timedCtx)
 			require.NoError(t, err, "reverse channel never became ready")
 
-			grpchantesting.RunChannelTestCases(t, ch, true)
+			testFunc(ctx, t, ch)
 
-			if !nested {
+			if mode == modeRunNested {
 				// nested/recursive test
-				runTests(ctx, t, true, tunnelpb.NewTunnelServiceClient(ch), ts, testSvr)
+				runTests(
+					ctx, t, modeIsNested,
+					tunnelpb.NewTunnelServiceClient(ch),
+					ts, testSvr, testFunc,
+				)
 			}
 
 			for i, rt := range ts.AllReverseTunnels() {
@@ -143,6 +218,58 @@ func runTests(ctx context.Context, t *testing.T, nested bool, cli tunnelpb.Tunne
 			}
 		})
 	})
+}
+
+func runDeadlockTests(ctx context.Context, t *testing.T, ch grpc.ClientConnInterface) {
+	stub := grpchantesting.NewTestServiceClient(ch)
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	slowOneDone := make(chan struct{})
+	defer func() {
+		cancel()
+		<-slowOneDone
+	}()
+	slowCtx := ctx
+	go func() {
+		// the slow one
+		defer close(slowOneDone)
+
+		stream, err := stub.BidiStream(slowCtx)
+		require.NoError(t, err)
+		for i := 0; i < 2; i++ {
+			err := stream.Send(&grpchantesting.Message{
+				DelayMillis: 1000,
+				Payload:     bytes.Repeat([]byte{0, 1, 2, 3}, 5_000),
+			})
+			if err != nil {
+				require.Error(t, ctx.Err())
+				break
+			}
+		}
+	}()
+
+	grp, ctx := errgroup.WithContext(ctx)
+	for i := 0; i < 20; i++ {
+		grp.Go(func() error {
+			// this should proceed just fine, regardless of the slow one
+			stream, err := stub.ClientStream(ctx)
+			if err != nil {
+				return err
+			}
+			for j := 0; j < 10; j++ {
+				err := stream.Send(&grpchantesting.Message{
+					Payload: bytes.Repeat([]byte{0, 1, 2, 3}, 10_000),
+				})
+				if err != nil {
+					return err
+				}
+			}
+			_, err = stream.CloseAndRecv()
+			return err
+		})
+	}
+	err := grp.Wait()
+	require.NoError(t, err)
 }
 
 func TestTunnelServiceHandler_Concurrency(t *testing.T) {
@@ -174,9 +301,9 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 		require.NoError(t, err, "failed to close client conn")
 	}()
 
-	tc, err := tunnelpb.NewTunnelServiceClient(cc).OpenTunnel(context.Background())
+	tunnelCli := tunnelpb.NewTunnelServiceClient(cc)
+	ch, err := NewChannel(context.Background(), tunnelCli)
 	require.NoError(t, err)
-	ch := NewChannel(tc)
 	defer func() {
 		ch.Close()
 		<-ch.Done()

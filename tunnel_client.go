@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"reflect"
 	"sync"
+	"sync/atomic"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -21,17 +23,33 @@ import (
 
 // NewChannel creates a new channel for issues RPCs. The returned channel
 // implements [grpc.ClientConnInterface], so it can be used to create stubs
-// and issue other RPCs, which are all carried over the given stream.
-func NewChannel(stream tunnelpb.TunnelService_OpenTunnelClient) TunnelChannel {
+// and issue other RPCs, which are all carried over a single tunnel stream
+// opened using the given stub. The given context defines the lifetime of
+// the stream and therefore of the channel; if the context times out or is
+// cancelled, the channel will be closed.
+func NewChannel(ctx context.Context, stub tunnelpb.TunnelServiceClient, opts ...grpc.CallOption) (TunnelChannel, error) {
+	ctx = metadata.AppendToOutgoingContext(ctx, grpctunnelNegotiateKey, grpctunnelNegotiateVal)
+	stream, err := stub.OpenTunnel(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	respMD, err := stream.Header()
+	if err != nil {
+		return nil, err
+	}
+	vals := respMD.Get(grpctunnelNegotiateKey)
+	serverSendsSettings := len(vals) > 0 && vals[0] == grpctunnelNegotiateVal
+	reqMD, _ := metadata.FromOutgoingContext(stream.Context())
 	stream = &threadSafeOpenTunnelClient{TunnelService_OpenTunnelClient: stream}
-	md, _ := metadata.FromOutgoingContext(stream.Context())
-	return newTunnelChannel(stream, md, func(*tunnelChannel) { _ = stream.CloseSend() })
+	return newTunnelChannel(stream, reqMD, serverSendsSettings, func(*tunnelChannel) { _ = stream.CloseSend() }), nil
 }
 
 func newReverseChannel(stream tunnelpb.TunnelService_OpenReverseTunnelServer, onClose func(*tunnelChannel)) *tunnelChannel {
-	stream = &threadSafeOpenReverseTunnelServer{TunnelService_OpenReverseTunnelServer: stream}
 	md, _ := metadata.FromIncomingContext(stream.Context())
-	return newTunnelChannel(stream, md, onClose)
+	vals := md.Get(grpctunnelNegotiateKey)
+	serverSendsSettings := len(vals) > 0 && vals[0] == grpctunnelNegotiateVal
+	stream = &threadSafeOpenReverseTunnelServer{TunnelService_OpenReverseTunnelServer: stream}
+	return newTunnelChannel(stream, md, serverSendsSettings, onClose)
 }
 
 type tunnelStreamClient interface {
@@ -60,7 +78,7 @@ type TunnelChannel interface {
 	//
 	// For forward tunnels, this is a client context. So it will include
 	// outgoing metadata for the request headers that were used to open the
-	// tunnel. For reverse tunnels, this is a server context.  So that request
+	// tunnel. For reverse tunnels, this is a server context. So that request
 	// metadata will be available as incoming metadata.
 	Context() context.Context
 	// Done returns a channel that can be used to await the channel closing.
@@ -137,11 +155,16 @@ func (h *threadSafeOpenReverseTunnelServer) RecvMsg(msg interface{}) error {
 }
 
 type tunnelChannel struct {
-	stream         tunnelStreamClient
-	tunnelMetadata metadata.MD
-	ctx            context.Context
-	cancel         context.CancelFunc
-	tearDown       func(*tunnelChannel)
+	stream              tunnelStreamClient
+	tunnelMetadata      metadata.MD
+	serverSendsSettings bool
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	tearDown            func(*tunnelChannel)
+
+	awaitSettings chan struct{}
+	settings      *tunnelpb.Settings
+	useRevision   tunnelpb.ProtocolRevision
 
 	mu            sync.RWMutex
 	streams       map[int64]*tunnelClientStream
@@ -153,17 +176,26 @@ type tunnelChannel struct {
 	streamCreation sync.Mutex
 }
 
-func newTunnelChannel(stream tunnelStreamClient, tunnelMetadata metadata.MD, tearDown func(*tunnelChannel)) *tunnelChannel {
+func newTunnelChannel(stream tunnelStreamClient, tunnelMetadata metadata.MD, serverSendsSettings bool, tearDown func(*tunnelChannel)) *tunnelChannel {
 	ctx, cancel := context.WithCancel(stream.Context())
 	c := &tunnelChannel{
-		stream:         stream,
-		ctx:            ctx,
-		tunnelMetadata: tunnelMetadata,
-		cancel:         cancel,
-		tearDown:       tearDown,
-		streams:        map[int64]*tunnelClientStream{},
+		stream:              stream,
+		tunnelMetadata:      tunnelMetadata,
+		serverSendsSettings: serverSendsSettings,
+		ctx:                 ctx,
+		cancel:              cancel,
+		tearDown:            tearDown,
+		streams:             map[int64]*tunnelClientStream{},
+		awaitSettings:       make(chan struct{}),
 	}
 	go c.recvLoop()
+
+	// make sure we've gotten settings from the server before we return
+	select {
+	case <-c.awaitSettings:
+	case <-ctx.Done():
+	}
+
 	return c
 }
 
@@ -213,15 +245,19 @@ func (c *tunnelChannel) Invoke(ctx context.Context, methodName string, req, resp
 	rv := reflect.Indirect(reflect.ValueOf(resp))
 	extraResp := reflect.New(rv.Type()).Interface()
 	extraErr := str.RecvMsg(extraResp)
-	switch extraErr {
-	case nil:
-		return status.Errorf(codes.Internal, "unary RPC returned >1 response message")
-	case io.EOF:
-		// this is what we want: nothing else in the stream
-		return nil
-	default:
-		return err
+	if extraErr == nil {
+		// Doh!
+		str.cancel()
+		extraErr = status.Errorf(codes.Internal, "unary RPC returned >1 response message")
 	}
+	// make sure to give thread-safe visibility to any trailers
+	// recorded via use of the grpc.Trailer call option.
+	str.Trailer()
+
+	if errors.Is(extraErr, io.EOF) {
+		return nil
+	}
+	return extraErr
 }
 
 func (c *tunnelChannel) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodName string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
@@ -243,8 +279,10 @@ func (c *tunnelChannel) newStream(ctx context.Context, clientStreams, serverStre
 		StreamId: str.streamID,
 		Frame: &tunnelpb.ClientToServer_NewStream{
 			NewStream: &tunnelpb.NewStream{
-				MethodName:     methodName,
-				RequestHeaders: toProto(md),
+				MethodName:        methodName,
+				RequestHeaders:    toProto(md),
+				ProtocolRevision:  c.useRevision,
+				InitialWindowSize: initialWindowSize,
 			},
 		},
 	})
@@ -256,7 +294,7 @@ func (c *tunnelChannel) newStream(ctx context.Context, clientStreams, serverStre
 		// if context gets cancelled, make sure
 		// we shut down the stream
 		<-str.ctx.Done()
-		str.cancel(str.ctx.Err())
+		str.cancelStream(str.ctx.Err())
 	}()
 	return str, nil
 }
@@ -327,13 +365,12 @@ func (c *tunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 		}
 	}
 
-	ch := make(chan tunnelpb.ServerToClientFrame, 1)
 	ctx, cncl := context.WithCancel(ctx)
 	ctx = context.WithValue(ctx, tunnelMetadataOutgoingContextKey{}, c.tunnelMetadata)
 	ctx = context.WithValue(ctx, tunnelChannelContextKey{}, c)
 	str := &tunnelClientStream{
 		ctx:              ctx,
-		cncl:             cncl,
+		cancel:           cncl,
 		ch:               c,
 		streamID:         streamID,
 		method:           methodName,
@@ -342,23 +379,108 @@ func (c *tunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 		trailersTargets:  tlrs,
 		isClientStream:   clientStreams,
 		isServerStream:   serverStreams,
-		ingestChan:       ch,
-		readChan:         ch,
 		gotHeadersSignal: make(chan struct{}),
 		doneSignal:       make(chan struct{}),
 	}
+	sendData := func(data []byte, totalSize uint32, first bool) error {
+		if first {
+			return c.stream.Send(&tunnelpb.ClientToServer{
+				StreamId: streamID,
+				Frame: &tunnelpb.ClientToServer_RequestMessage{
+					RequestMessage: &tunnelpb.MessageData{
+						Size: totalSize,
+						Data: data,
+					},
+				},
+			})
+		}
+		return c.stream.Send(&tunnelpb.ClientToServer{
+			StreamId: streamID,
+			Frame: &tunnelpb.ClientToServer_MoreRequestData{
+				MoreRequestData: data,
+			},
+		})
+	}
+	if c.useRevision == tunnelpb.ProtocolRevision_REVISION_ZERO {
+		str.sender = newSenderWithoutFlowControl(sendData)
+		str.receiver = newReceiverWithoutFlowControl[tunnelpb.ServerToClientFrame](ctx)
+	} else {
+		str.sender = newSender(ctx, c.settings.InitialWindowSize, sendData)
+		str.receiver = newReceiver(
+			func(frame tunnelpb.ServerToClientFrame) uint {
+				switch frame := frame.(type) {
+				case *tunnelpb.ServerToClient_ResponseMessage:
+					return uint(len(frame.ResponseMessage.Data))
+				case *tunnelpb.ServerToClient_MoreResponseData:
+					return uint(len(frame.MoreResponseData))
+				default:
+					return 0
+				}
+			},
+			func(windowUpdate uint32) {
+				if str.loadDone() != nil {
+					// don't bother with window updates; no more data coming
+					return
+				}
+				_ = c.stream.Send(&tunnelpb.ClientToServer{
+					StreamId: streamID,
+					Frame: &tunnelpb.ClientToServer_WindowUpdate{
+						WindowUpdate: windowUpdate,
+					},
+				})
+			},
+			initialWindowSize,
+		)
+	}
+
 	c.streams[streamID] = str
 
 	return str, md, nil
 }
 
 func (c *tunnelChannel) recvLoop() {
+	if c.serverSendsSettings {
+		in, err := c.stream.Recv()
+		if err != nil {
+			c.close(fmt.Errorf("failed to read settings from server: %w", err))
+			return
+		}
+		if in.StreamId != -1 {
+			c.close(fmt.Errorf("protocol error: settings frame had bad stream ID (%d)", in.StreamId))
+			return
+		}
+		settings, ok := in.Frame.(*tunnelpb.ServerToClient_Settings)
+		if !ok {
+			c.close(fmt.Errorf("protocol error: first frame was not settings (instead was %T)", in.Frame))
+			return
+		}
+		var valid bool
+		for _, rev := range settings.Settings.SupportedProtocolRevisions {
+			switch rev {
+			case tunnelpb.ProtocolRevision_REVISION_ZERO, tunnelpb.ProtocolRevision_REVISION_ONE:
+				if rev > c.useRevision {
+					// use highest version that both server and client supports
+					c.useRevision = rev
+				}
+				valid = true
+			}
+		}
+		if !valid {
+			c.close(fmt.Errorf("protocol error: server does not support revision %s or %s (supported = %v)",
+				tunnelpb.ProtocolRevision_REVISION_ZERO, tunnelpb.ProtocolRevision_REVISION_ONE, settings.Settings.SupportedProtocolRevisions))
+			return
+		}
+		c.settings = settings.Settings
+	}
+	close(c.awaitSettings)
+
 	for {
 		in, err := c.stream.Recv()
 		if err != nil {
 			c.close(err)
 			return
 		}
+
 		str, err := c.getStream(in.StreamId)
 		if err != nil {
 			c.close(err)
@@ -413,7 +535,7 @@ func (c *tunnelChannel) close(err error) bool {
 	}
 	c.err = err
 	for _, st := range c.streams {
-		st.cncl()
+		st.cancel()
 	}
 	c.streams = nil
 	return true
@@ -421,7 +543,7 @@ func (c *tunnelChannel) close(err error) bool {
 
 type tunnelClientStream struct {
 	ctx      context.Context
-	cncl     context.CancelFunc
+	cancel   context.CancelFunc
 	ch       *tunnelChannel
 	streamID int64
 	method   string
@@ -433,20 +555,21 @@ type tunnelClientStream struct {
 	isClientStream bool
 	isServerStream bool
 
-	// for "ingesting" frames into channel, from receive loop
-	ingestMu         sync.Mutex
-	ingestChan       chan<- tunnelpb.ServerToClientFrame
+	sender   sender
+	receiver receiver[tunnelpb.ServerToClientFrame]
+	done     atomic.Pointer[errHolder]
+
+	// for processing metadata frames, from receive loop
+	metaMu           sync.Mutex
 	gotHeaders       bool
 	gotHeadersSignal chan struct{}
 	headers          metadata.MD
-	done             error
 	doneSignal       chan struct{}
 	trailers         metadata.MD
 
 	// for reading frames from channel, to read message data
-	readMu   sync.Mutex
-	readChan <-chan tunnelpb.ServerToClientFrame
-	readErr  error
+	readMu  sync.Mutex
+	readErr error
 
 	// for sending frames to server
 	writeMu    sync.Mutex
@@ -493,7 +616,7 @@ func (st *tunnelClientStream) CloseSend() error {
 
 	select {
 	case <-st.doneSignal:
-		return st.done
+		return st.loadDone()
 	default:
 		// don't block since we are holding writeMu
 	}
@@ -508,6 +631,13 @@ func (st *tunnelClientStream) CloseSend() error {
 			HalfClose: &emptypb.Empty{},
 		},
 	})
+}
+
+func (st *tunnelClientStream) loadDone() error {
+	if val := st.done.Load(); val != nil {
+		return val.error
+	}
+	return nil
 }
 
 func (st *tunnelClientStream) Context() context.Context {
@@ -528,57 +658,18 @@ func (st *tunnelClientStream) SendMsg(m interface{}) error {
 	if err != nil {
 		return err
 	}
-
-	i := 0
-	for {
-		if err := st.err(); err != nil {
-			return io.EOF
-		}
-
-		chunk := b
-		if len(b) > maxChunkSize {
-			chunk = b[:maxChunkSize]
-		}
-
-		if i == 0 {
-			err = st.stream.Send(&tunnelpb.ClientToServer{
-				StreamId: st.streamID,
-				Frame: &tunnelpb.ClientToServer_RequestMessage{
-					RequestMessage: &tunnelpb.MessageData{
-						Size: int32(len(b)),
-						Data: chunk,
-					},
-				},
-			})
-		} else {
-			err = st.stream.Send(&tunnelpb.ClientToServer{
-				StreamId: st.streamID,
-				Frame: &tunnelpb.ClientToServer_MoreRequestData{
-					MoreRequestData: chunk,
-				},
-			})
-		}
-
-		if err != nil {
-			return err
-		}
-
-		if len(b) <= maxChunkSize {
-			break
-		}
-
-		b = b[maxChunkSize:]
-		i++
+	if int64(len(b)) > math.MaxUint32 {
+		return status.Errorf(codes.ResourceExhausted, "serialized message is too large: %d bytes > maximum %d bytes", len(b), math.MaxUint32)
 	}
 
-	return nil
+	return st.sender.send(b)
 }
 
 func (st *tunnelClientStream) RecvMsg(m interface{}) error {
 	data, ok, err := st.readMsg()
 	if err != nil {
 		if !ok {
-			st.cancel(err)
+			st.cancelStream(err)
 		}
 		return err
 	}
@@ -622,11 +713,9 @@ func (st *tunnelClientStream) readMsgLocked() (data []byte, ok bool, err error) 
 	msgLen := -1
 	var b []byte
 	for {
-		in, ok := <-st.readChan
+		in, ok := st.receiver.dequeue()
 		if !ok {
-			// don't need lock to read st.done; observing
-			// input channel close provides safe visibility
-			return nil, true, st.done
+			return nil, true, st.loadDone()
 		}
 
 		switch in := in.(type) {
@@ -661,15 +750,6 @@ func (st *tunnelClientStream) readMsgLocked() (data []byte, ok bool, err error) 
 	}
 }
 
-func (st *tunnelClientStream) err() error {
-	select {
-	case <-st.doneSignal:
-		return st.done
-	default:
-		return st.ctx.Err()
-	}
-}
-
 func (st *tunnelClientStream) acceptServerFrame(frame tunnelpb.ServerToClientFrame) {
 	if st == nil {
 		// can happen if client decided that the stream ID was recently used
@@ -680,9 +760,12 @@ func (st *tunnelClientStream) acceptServerFrame(frame tunnelpb.ServerToClientFra
 	}
 
 	switch frame := frame.(type) {
+	case *tunnelpb.ServerToClient_Settings:
+		st.finishStream(errors.New("protocol error: unexpected settings frame"), nil)
+
 	case *tunnelpb.ServerToClient_ResponseHeaders:
-		st.ingestMu.Lock()
-		defer st.ingestMu.Unlock()
+		st.metaMu.Lock()
+		defer st.metaMu.Unlock()
 		if st.gotHeaders {
 			// TODO: cancel RPC and fail locally with internal error?
 			return
@@ -693,59 +776,43 @@ func (st *tunnelClientStream) acceptServerFrame(frame tunnelpb.ServerToClientFra
 			*hdrs = st.headers
 		}
 		close(st.gotHeadersSignal)
-		return
 
 	case *tunnelpb.ServerToClient_CloseStream:
 		trailers := fromProto(frame.CloseStream.ResponseTrailers)
 		err := status.FromProto(frame.CloseStream.Status).Err()
 		st.finishStream(err, trailers)
-	}
 
-	st.ingestMu.Lock()
-	defer st.ingestMu.Unlock()
+	case *tunnelpb.ServerToClient_WindowUpdate:
+		st.sender.updateWindow(frame.WindowUpdate)
 
-	if st.done != nil {
-		return
-	}
+	case nil:
+		st.finishStream(errors.New("protocol error: unrecognized frame type"), nil)
 
-	select {
-	case st.ingestChan <- frame:
-	case <-st.ctx.Done():
+	default:
+		if err := st.receiver.accept(frame); err != nil {
+			st.finishStream(err, nil)
+		}
 	}
 }
 
-func (st *tunnelClientStream) cancel(err error) {
-	st.finishStream(err, nil)
-	// let server know
-	st.writeMu.Lock()
-	defer st.writeMu.Unlock()
-	_ = st.stream.Send(&tunnelpb.ClientToServer{
-		StreamId: st.streamID,
-		Frame: &tunnelpb.ClientToServer_Cancel{
-			Cancel: &emptypb.Empty{},
-		},
-	})
-}
-
-func (st *tunnelClientStream) finishStream(err error, trailers metadata.MD) {
-	st.ch.removeStream(st.streamID)
-	defer st.cncl()
-
-	st.ingestMu.Lock()
-	defer st.ingestMu.Unlock()
-
-	if st.done != nil {
-		// RPC already finished! just ignore...
+func (st *tunnelClientStream) cancelStream(err error) {
+	if !st.finishStream(err, nil) {
+		// stream already closed
 		return
 	}
-	st.trailers = trailers
-	for _, tlrs := range st.trailersTargets {
-		*tlrs = trailers
-	}
-	if !st.gotHeaders {
-		st.gotHeaders = true
-		close(st.gotHeadersSignal)
-	}
+	st.receiver.cancel()
+	// Let server know, too.
+	go func() {
+		_ = st.stream.Send(&tunnelpb.ClientToServer{
+			StreamId: st.streamID,
+			Frame: &tunnelpb.ClientToServer_Cancel{
+				Cancel: &emptypb.Empty{},
+			},
+		})
+	}()
+}
+
+func (st *tunnelClientStream) finishStream(err error, trailers metadata.MD) bool {
 	switch err {
 	case nil:
 		err = io.EOF
@@ -754,8 +821,26 @@ func (st *tunnelClientStream) finishStream(err error, trailers metadata.MD) {
 	case context.Canceled:
 		err = status.Error(codes.Canceled, err.Error())
 	}
-	st.done = err
+	if !st.done.CompareAndSwap(nil, &errHolder{err}) {
+		// done already set? then RPC already finished
+		return false
+	}
+	defer st.cancel()
+	st.ch.removeStream(st.streamID)
+	st.receiver.close()
 
-	close(st.ingestChan)
+	st.metaMu.Lock()
+	defer st.metaMu.Unlock()
+
+	st.trailers = trailers
+	for _, tlrs := range st.trailersTargets {
+		*tlrs = trailers
+	}
+	if !st.gotHeaders {
+		st.gotHeaders = true
+		close(st.gotHeadersSignal)
+	}
 	close(st.doneSignal)
+
+	return true
 }

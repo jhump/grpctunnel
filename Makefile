@@ -29,7 +29,7 @@ vet:
 
 .PHONY: staticcheck
 staticcheck:
-	@go install honnef.co/go/tools/cmd/staticcheck@v0.4.0
+	@go install honnef.co/go/tools/cmd/staticcheck@v0.4.6
 	staticcheck ./...
 
 .PHONY: ineffassign
@@ -53,7 +53,6 @@ test:
 
 .PHONY: generate
 generate:
-	cd proto && buf generate
 	go generate ./...
 
 .PHONY: testcover

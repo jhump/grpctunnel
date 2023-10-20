@@ -6,8 +6,8 @@ require (
 	github.com/fullstorydev/grpchan v1.1.1
 	github.com/stretchr/testify v1.8.0
 	golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e
-	google.golang.org/genproto v0.0.0-20221013201013-33fc6f83cba4
-	google.golang.org/grpc v1.50.0
+	google.golang.org/genproto v0.0.0-20230110181048-76db0878b65f
+	google.golang.org/grpc v1.53.0
 	google.golang.org/protobuf v1.28.1
 )
 
