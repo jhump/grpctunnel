@@ -754,7 +754,7 @@ func (st *tunnelClientStream) readMsgLocked() (data []byte, ok bool, err error) 
 		switch in := in.(type) {
 		case *tunnelpb.ServerToClient_ResponseMessage:
 			if msgLen != -1 {
-				return nil, false, status.Errorf(codes.Internal, "server sent redundant response message envelope")
+				return nil, false, status.Errorf(codes.Internal, "server sent response message envelope before previous message finished (%d/%d)", len(b), msgLen)
 			}
 			msgLen = int(in.ResponseMessage.Size)
 			b = in.ResponseMessage.Data

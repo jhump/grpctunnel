@@ -15,6 +15,7 @@ import (
 )
 
 const (
+	// TODO: make these configurable
 	initialWindowSize = 65536
 	chunkMax          = 16384
 )
@@ -191,6 +192,8 @@ func (r *defaultReceiver[_]) handleClosure(b *bool) {
 func (r *defaultReceiver[T]) dequeue() (T, bool) {
 	var windowUpdate uint
 	defer func() {
+		// TODO: Support minimum update size, so we can batch
+		//       updates and send fewer messages over the network.
 		if windowUpdate > 0 {
 			r.updateWindow(uint32(windowUpdate))
 		}
@@ -264,9 +267,10 @@ func (s *noFlowControlSender) updateWindow(_ uint32) {
 type noFlowControlReceiver[T any] struct {
 	ctx context.Context
 
-	ch      chan T
-	closed  chan struct{}
-	doClose sync.Once
+	ingestMu sync.Mutex
+	ch       chan T
+	closed   chan struct{}
+	doClose  sync.Once
 }
 
 func newReceiverWithoutFlowControl[T any](ctx context.Context) receiver[T] {
@@ -278,22 +282,35 @@ func newReceiverWithoutFlowControl[T any](ctx context.Context) receiver[T] {
 }
 
 func (r *noFlowControlReceiver[T]) accept(item T) error {
-	// If closed is already done, don't try to add an item to ch
+	r.ingestMu.Lock()
+	defer r.ingestMu.Unlock()
+
+	// First check closed channel. If already closed, we can't run select
+	// below because trying to write to closed channel r.ch will panic.
 	select {
 	case <-r.closed:
 		return nil
 	default:
 	}
+
 	select {
 	case r.ch <- item:
 	case <-r.closed:
+		// another thread intends to close; so abort and release the lock
 	}
 	return nil
 }
 
 func (r *noFlowControlReceiver[T]) close() {
 	r.doClose.Do(func() {
+		// Let any concurrent accepting thread know that we intend
+		// to close and thus need the lock.
 		close(r.closed)
+		// Must close the channel while lock is held to prevent
+		// panic in accept().
+		r.ingestMu.Lock()
+		defer r.ingestMu.Unlock()
+		close(r.ch)
 	})
 }
 
@@ -302,23 +319,6 @@ func (r *noFlowControlReceiver[T]) cancel() {
 }
 
 func (r *noFlowControlReceiver[T]) dequeue() (T, bool) {
-	var zero T
-	if r.ctx.Err() != nil {
-		return zero, false
-	}
-	// If there's an item in ch, make sure to use it
-	// before potentially looking at closed channel
-	select {
-	case t, ok := <-r.ch:
-		return t, ok
-	default:
-	}
-	select {
-	case t, ok := <-r.ch:
-		return t, ok
-	case <-r.closed:
-		return zero, false
-	case <-r.ctx.Done():
-		return zero, false
-	}
+	t, ok := <-r.ch
+	return t, ok
 }
