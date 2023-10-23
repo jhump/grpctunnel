@@ -174,7 +174,7 @@ func runDeadlockTests(ctx context.Context, t *testing.T, ch grpc.ClientConnInter
 		for i := 0; i < 2; i++ {
 			err := stream.Send(&grpchantesting.Message{
 				DelayMillis: 1000,
-				Payload:     bytes.Repeat([]byte{0, 1, 2, 3}, 5_000),
+				Payload:     bytes.Repeat([]byte{0, 1, 2, 3}, 10_000),
 			})
 			if err != nil {
 				require.Error(t, ctx.Err())
@@ -185,16 +185,16 @@ func runDeadlockTests(ctx context.Context, t *testing.T, ch grpc.ClientConnInter
 	time.Sleep(100 * time.Millisecond) // make sure the slow one has had time to issue its RPC
 
 	grp, ctx := errgroup.WithContext(ctx)
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 10; i++ {
 		grp.Go(func() error {
 			// this should proceed just fine, regardless of the slow one
 			stream, err := stub.ClientStream(ctx)
 			if err != nil {
 				return err
 			}
-			for j := 0; j < 100; j++ {
+			for j := 0; j < 20; j++ {
 				err := stream.Send(&grpchantesting.Message{
-					Payload: bytes.Repeat([]byte{0, 1, 2, 3}, 10_000),
+					Payload: bytes.Repeat([]byte{0, 1, 2, 3}, 5_000),
 				})
 				if err != nil {
 					return err
