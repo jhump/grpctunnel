@@ -19,14 +19,14 @@ methods for forward and reverse tunneling.
 
    A forward tunnel allows for all requests made on the tunnel to be directed
    to the same server. With a typical gRPC client, connecting to a replicated
-   server, requests can round-robin across backends. For typical stateless
-   applications, this is desirable for load balancing and robustness. But some
-   applications that are not stateless may need affinity. The tunnel provides
-   that affinity. Instead of the client making multiple requests, which could
-   all be directed to different backends, the client makes one request to open
-   a tunnel. The resulting tunnel can then be used to create other RPC stubs,
-   so that all requests issued via those stubs are directed to the single
-   backend to which the tunnel was opened.
+   server, requests are typically load balanced across backends. For typical
+   stateless applications, this is desirable for resource utilization and fault
+   tolerance. But some applications that are not stateless may need affinity.
+   The tunnel provides that affinity. Instead of the client making multiple
+   requests, which could all be directed to different backends, the client
+   makes one request to open a tunnel. The resulting tunnel can then be used
+   to create other RPC stubs, so that all requests issued via those stubs are
+   directed to the single backend to which the tunnel was opened.
 
  * **Reverse Tunnel**: A reverse tunnel is the opposite: requests flow in the
    reverse direction of a normal gRPC connection. This means that the gRPC
@@ -145,12 +145,9 @@ if err != nil {
 	log.Fatal(err)
 }
 
-// Create the tunnel.
 tunnelStub := tunnelpb.NewTunnelServiceClient(cc)
-stream, err := tunnelStub.OpenTunnel(context.Background())
-
-// Open a tunnel and return a channel.
-ch, err := grpctunnel.NewChannel(tunnelStub)
+// Opens a tunnel and return a channel.
+ch, err := grpctunnel.NewChannel(tunnelStub).Start(context.Background())
 if err != nil {
 	log.Fatal(err)
 }
@@ -158,14 +155,10 @@ if err != nil {
 // TODO: Create stubs using ch to send RPCs through the tunnel.
 ```
 
-Client code should not interact with the stream at all or risk corrupting the
-tunneling protocol. (All interactions with the stream should be done via the
-channel.)
-
 To close the tunnel, use the channel's `Close` method. This will also close the
 underlying stream. If any RPCs are in progress on the channel when it is closed,
-they will be cancelled. The channel is also closed if the context used to create
-the stream is cancelled or times out.
+they will be cancelled. The channel is also closed if the context passed to
+`Start` is cancelled or times out.
 
 To use client interceptors with these channels, wrap them using
 [`grpchan.InterceptClientConn`](https://pkg.go.dev/github.com/fullstorydev/grpchan#InterceptClientConn)

@@ -30,6 +30,7 @@ const (
 // method to actually create a reverse tunnel and handle requests.
 type ReverseTunnelServer struct {
 	stub     tunnelpb.TunnelServiceClient
+	opts     tunnelOpts
 	handlers grpchan.HandlerMap
 
 	mu        sync.Mutex
@@ -40,12 +41,16 @@ type ReverseTunnelServer struct {
 
 // NewReverseTunnelServer creates a new server that uses the given stub to
 // create reverse tunnels.
-func NewReverseTunnelServer(stub tunnelpb.TunnelServiceClient) *ReverseTunnelServer {
-	return &ReverseTunnelServer{
+func NewReverseTunnelServer(stub tunnelpb.TunnelServiceClient, opts ...TunnelOption) *ReverseTunnelServer {
+	r := &ReverseTunnelServer{
 		stub:      stub,
 		handlers:  grpchan.HandlerMap{},
 		instances: map[tunnelpb.TunnelService_OpenReverseTunnelClient]struct{}{},
 	}
+	for _, opt := range opts {
+		opt.apply(&r.opts)
+	}
+	return r
 }
 
 // RegisterService implements grpc.ServiceRegistrar. This allows you to use this
@@ -82,19 +87,28 @@ func (s *ReverseTunnelServer) RegisterService(desc *grpc.ServiceDesc, srv interf
 // the gRPC server associated with the stub used to create this reverse tunnel
 // server.
 func (s *ReverseTunnelServer) Serve(ctx context.Context, opts ...grpc.CallOption) (started bool, err error) {
+	// TODO: validate options and maybe return an error
+	ctx = metadata.AppendToOutgoingContext(ctx, grpctunnelNegotiateKey, grpctunnelNegotiateVal)
 	stream, err := s.stub.OpenReverseTunnel(ctx, opts...)
 	if err != nil {
 		return false, err
 	}
+	respMD, err := stream.Header()
+	if err != nil {
+		return false, err
+	}
+	vals := respMD.Get(grpctunnelNegotiateKey)
+	clientAcceptsSettings := len(vals) > 0 && vals[0] == grpctunnelNegotiateVal
+
+	// TODO: we don't have a way to access outgoing metadata that gets added by
+	//       client interceptors that may be run by the stub.
+	reqMD, _ := metadata.FromOutgoingContext(ctx)
 	stream = &threadSafeOpenReverseTunnelClient{TunnelService_OpenReverseTunnelClient: stream}
 	if err := s.addInstance(stream); err != nil {
 		return false, err
 	}
 	defer s.wg.Done()
-	// TODO: we don't have a way to access outgoing metadata that gets added by
-	//       client interceptors that may be run by the stub.
-	md, _ := metadata.FromOutgoingContext(ctx)
-	err = serveTunnel(stream, md, s.handlers, s.isClosing)
+	err = serveTunnel(stream, reqMD, clientAcceptsSettings, &s.opts, s.handlers, s.isClosing)
 	if err == context.Canceled && ctx.Err() == nil && s.isClosed() {
 		// If we get back a cancelled error, but the given context is not
 		// cancelled and this server is closed, then the cancellation was

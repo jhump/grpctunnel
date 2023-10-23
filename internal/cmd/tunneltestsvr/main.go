@@ -20,6 +20,7 @@ import (
 
 func main() {
 	port := flag.Int("port", 26354, "the port on which this server will listen")
+	noFlowControl := flag.Bool("no-flow-control", false, "disables flow control")
 	flag.Parse()
 
 	svr := grpc.NewServer()
@@ -32,6 +33,7 @@ func main() {
 			}
 			return vals[0]
 		},
+		DisableFlowControl: *noFlowControl,
 	})
 	tunnelpb.RegisterTunnelServiceServer(svr, tunnelSvc.Service())
 	gen.RegisterTunnelTestServiceServer(svr, &tunnelTester{tunnelSvc: tunnelSvc})
