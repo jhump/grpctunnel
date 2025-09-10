@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/fullstorydev/grpchan/grpchantesting"
+	"github.com/jhump/grpctunnel/internal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -350,7 +351,7 @@ func setupServer(t *testing.T, svc grpchantesting.TestServiceServer, disableFlow
 		<-serveDone
 	})
 
-	cc, err := grpc.Dial(l.Addr().String(), grpc.WithBlock(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := internal.BlockingDial(t.Context(), l.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err, "failed to create client")
 	t.Cleanup(func() {
 		err := cc.Close()

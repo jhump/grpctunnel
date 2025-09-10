@@ -6,11 +6,11 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"github.com/fullstorydev/grpchan"
 	"log"
 	"sync/atomic"
 	"time"
 
+	"github.com/fullstorydev/grpchan"
 	"github.com/fullstorydev/grpchan/grpchantesting"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -38,12 +38,8 @@ func main() {
 	ctx := context.Background()
 	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	cc, err := grpc.DialContext(dialCtx,
-		fmt.Sprintf("127.0.0.1:%d", *serverPort),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-		grpc.WithReturnConnectionError(),
-	)
+	cc, err := internal.BlockingDial(dialCtx, fmt.Sprintf("127.0.0.1:%d", *serverPort),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatal(err)
 	}
