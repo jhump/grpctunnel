@@ -39,6 +39,9 @@ type sender struct {
 }
 
 func newSender(ctx context.Context, initialWindowSize, maxChunkSize uint32, sendFunc func([]byte, uint32, bool) error) *sender {
+	if maxChunkSize > initialWindowSize {
+		maxChunkSize = initialWindowSize
+	}
 	s := &sender{
 		ctx:           ctx,
 		maxChunkSize:  maxChunkSize,

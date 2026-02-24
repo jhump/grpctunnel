@@ -26,19 +26,52 @@ func TestTunnelServiceHandler(t *testing.T) {
 	// Basic tests of the tunnel service as a gRPC channel
 	var svr grpchantesting.TestServer
 	cli, ts := setupServer(t, &svr)
-	runTests(context.Background(), t, modeRunNested, cli, ts, &svr,
+	runTests(
+		context.Background(), t, modeRunNested, cli, ts, &svr,
 		func(_ context.Context, t *testing.T, ch grpc.ClientConnInterface) {
 			grpchantesting.RunChannelTestCases(t, ch, true)
-		})
+		},
+	)
 }
 
 func TestTunnelServiceHandler_Deadlocks(t *testing.T) {
-	var svr grpchantesting.TestServer
-	cli, ts := setupServer(t, &svr)
-	runTests(context.Background(), t, modeRunNested, cli, ts, &svr,
-		func(ctx context.Context, t *testing.T, ch grpc.ClientConnInterface) {
-			runDeadlockTests(ctx, t, ch)
+	testCases := []struct {
+		name string
+		opts []TunnelOption
+	}{
+		{
+			name: "default",
+		},
+		{
+			name: "tiny-chunk",
+			opts: []TunnelOption{WithMaxChunkSize(64)},
+		},
+		{
+			name: "oversized-chunk",
+			opts: []TunnelOption{WithMaxChunkSize(1024 * 1024 * 1024)},
+		},
+		{
+			name: "both-overridden",
+			opts: []TunnelOption{WithInitialWindowSize(16 * 1024), WithMaxChunkSize(4 * 1024)},
+		},
+	}
+	for _, tc := range testCases {
+		var svr grpchantesting.TestServer
+		cli, ts := setupServer(t, &svr, tc.opts...)
+		t.Run("server="+tc.name, func(t *testing.T) {
+			for _, tc := range testCases {
+				t.Run("client="+tc.name, func(t *testing.T) {
+					runTests(
+						context.Background(), t, modeRunNested, cli, ts, &svr,
+						func(ctx context.Context, t *testing.T, ch grpc.ClientConnInterface) {
+							runDeadlockTests(ctx, t, ch)
+						},
+						tc.opts...,
+					)
+				})
+			}
 		})
+	}
 }
 
 type nestingMode int
@@ -57,6 +90,7 @@ func runTests(
 	ts *TunnelServiceHandler,
 	testSvr *grpchantesting.TestServer,
 	testFunc func(ctx context.Context, t *testing.T, ch grpc.ClientConnInterface),
+	opts ...TunnelOption,
 ) {
 	prefix := ""
 	if mode == modeIsNested {
@@ -66,7 +100,7 @@ func runTests(
 
 	t.Run(prefix+"forward", func(t *testing.T) {
 		checkForGoroutineLeak(t, func() {
-			ch, err := NewChannel(cl).Start(ctx)
+			ch, err := NewChannel(cl, opts...).Start(ctx)
 			require.NoError(t, err, "failed to open tunnel")
 
 			defer func() {
@@ -79,9 +113,11 @@ func runTests(
 
 			if mode == modeRunNested {
 				// nested/recursive test
-				runTests(ch.Context(), t, modeIsNested,
+				runTests(
+					ch.Context(), t, modeIsNested,
 					tunnelpb.NewTunnelServiceClient(ch),
 					ts, testSvr, testFunc,
+					opts...,
 				)
 			}
 		})
@@ -127,6 +163,7 @@ func runTests(
 					ctx, t, modeIsNested,
 					tunnelpb.NewTunnelServiceClient(ch),
 					ts, testSvr, testFunc,
+					opts...,
 				)
 			}
 
@@ -284,7 +321,11 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 // TODO: also need more tests around channel lifecycle, and ensuring it
 // properly respects things like context cancellations, etc
 
-func setupServer(t *testing.T, svc grpchantesting.TestServiceServer) (tunnelpb.TunnelServiceClient, *TunnelServiceHandler) {
+func setupServer(t *testing.T, svc grpchantesting.TestServiceServer, opts ...TunnelOption) (tunnelpb.TunnelServiceClient, *TunnelServiceHandler) {
+	var options tunnelOpts
+	for _, opt := range opts {
+		opt.apply(&options)
+	}
 	ts := NewTunnelServiceHandler(TunnelServiceHandlerOptions{
 		AffinityKey: func(t TunnelChannel) any {
 			md, _ := metadata.FromIncomingContext(t.Context())
@@ -294,6 +335,8 @@ func setupServer(t *testing.T, svc grpchantesting.TestServiceServer) (tunnelpb.T
 			}
 			return vals[0]
 		},
+		InitialWindowSize: options.initialWindowSize,
+		MaxChunkSize:      options.maxChunkSize,
 	})
 	grpchantesting.RegisterTestServiceServer(ts, svc)
 	// recursive: tunnels can be run on top of tunnels

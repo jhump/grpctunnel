@@ -76,11 +76,11 @@ type TunnelServiceHandlerOptions struct {
 	// throughput at the cost of more memory usage.
 	InitialWindowSize uint32
 	// If non-zero, sets the maximum size of a single chunk of data to send. This
-	// wil be clamped to the above window size if set to a larger value. If zero,
-	// the default max chunk size is 16k. Increasing this can allow larger messages
-	// to be sent more quickly (fewer chunks, fewer flow control messages) but at
-	// the potential cost of fairness, in the event that multiple streams are trying
-	// to concurrently send large messages.
+	// wil be clamped to the peer's initial window size if set to a larger value.
+	// If zero, the default max chunk size is 16k. Increasing this can allow larger
+	// messages to be sent more quickly (fewer chunks, fewer flow control messages)
+	// but at the potential cost of fairness, in the event that multiple streams
+	// are trying to concurrently send large messages.
 	MaxChunkSize uint32
 
 	// TODO: Option for minimum update size, so receiver can choose to batch

@@ -24,7 +24,6 @@ import (
 
 func main() {
 	serverPort := flag.Int("server-port", 26354, "the port on which the server is listening")
-	noFlowControl := flag.Bool("no-flow-control", false, "disables flow control")
 	tunnelType := flag.String("tunnel-type", "both", `type of tunnel to test, can be "forward", "reverse", or "both"`)
 	flag.Parse()
 
@@ -45,14 +44,10 @@ func main() {
 	}
 
 	tunnelClient := tunnelpb.NewTunnelServiceClient(cc)
-	var tunnelOpts []grpctunnel.TunnelOption
-	if *noFlowControl {
-		tunnelOpts = []grpctunnel.TunnelOption{grpctunnel.WithDisableFlowControl()}
-	}
 
 	// First check the forward tunnel.
 	if *tunnelType != "reverse" {
-		tunnel, err := grpctunnel.NewChannel(tunnelClient, tunnelOpts...).Start(ctx)
+		tunnel, err := grpctunnel.NewChannel(tunnelClient).Start(ctx)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -71,7 +66,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		reverseTunnel := grpctunnel.NewReverseTunnelServer(tunnelClient, tunnelOpts...)
+		reverseTunnel := grpctunnel.NewReverseTunnelServer(tunnelClient)
 		// Over the tunnel, we just expose this simple test service
 		var svrCounts atomic.Int32
 		grpchantesting.RegisterTestServiceServer(withServerCounts(reverseTunnel, &svrCounts), &grpchantesting.TestServer{})
