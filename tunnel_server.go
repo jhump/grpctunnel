@@ -54,19 +54,22 @@ type tunnelServer struct {
 }
 
 func (s *tunnelServer) serve(tunnelMetadata metadata.MD) error {
-	if s.clientAcceptsSettings {
-		go func() {
-			_ = s.stream.Send(&tunnelpb.ServerToClient{
-				StreamId: -1,
-				Frame: &tunnelpb.ServerToClient_Settings{
-					Settings: &tunnelpb.Settings{
-						InitialWindowSize:          initialWindowSize,
-						SupportedProtocolRevisions: s.tunnelOpts.supportedRevisions(),
-					},
-				},
-			})
-		}()
+	if !s.clientAcceptsSettings {
+		return fmt.Errorf("protocol error: client only supports revision %v, but server only supports revision %v; upgrade client to v0.3 or later",
+			tunnelpb.ProtocolRevision_REVISION_ZERO, tunnelpb.ProtocolRevision_REVISION_ONE)
 	}
+
+	go func() {
+		_ = s.stream.Send(&tunnelpb.ServerToClient{
+			StreamId: -1,
+			Frame: &tunnelpb.ServerToClient_Settings{
+				Settings: &tunnelpb.Settings{
+					InitialWindowSize:          defaultInitialWindowSize,
+					SupportedProtocolRevisions: []tunnelpb.ProtocolRevision{tunnelpb.ProtocolRevision_REVISION_ONE},
+				},
+			},
+		})
+	}()
 
 	ctx := context.WithValue(s.stream.Context(), tunnelMetadataIncomingContextKey{}, tunnelMetadata)
 	ctx, cancel := context.WithCancel(ctx)
@@ -122,11 +125,12 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 		return true, status.Errorf(codes.Unavailable, "server is shutting down")
 	}
 
-	if frame.ProtocolRevision != tunnelpb.ProtocolRevision_REVISION_ZERO &&
-		frame.ProtocolRevision != tunnelpb.ProtocolRevision_REVISION_ONE {
+	if frame.ProtocolRevision == tunnelpb.ProtocolRevision_REVISION_ZERO {
+		return true, status.Errorf(codes.Unavailable, "server does not support protocol revision %d anymore; upgrade client to v0.3 or later", frame.ProtocolRevision)
+	}
+	if frame.ProtocolRevision != tunnelpb.ProtocolRevision_REVISION_ONE {
 		return true, status.Errorf(codes.Unavailable, "server does not support protocol revision %d", frame.ProtocolRevision)
 	}
-	noFlowControl := frame.ProtocolRevision == tunnelpb.ProtocolRevision_REVISION_ZERO
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -198,37 +202,32 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 			},
 		})
 	}
-	if noFlowControl {
-		str.sender = newSenderWithoutFlowControl(sendFunc)
-		str.receiver = newReceiverWithoutFlowControl[tunnelpb.ClientToServerFrame](ctx)
-	} else {
-		str.sender = newSender(ctx, frame.InitialWindowSize, sendFunc)
-		str.receiver = newReceiver(
-			func(m tunnelpb.ClientToServerFrame) uint {
-				switch m := m.(type) {
-				case *tunnelpb.ClientToServer_RequestMessage:
-					return uint(len(m.RequestMessage.Data))
-				case *tunnelpb.ClientToServer_MoreRequestData:
-					return uint(len(m.MoreRequestData))
-				default:
-					return 0
-				}
-			},
-			func(windowUpdate uint32) {
-				if str.loadHalfClosed() != nil {
-					// stream already half-closed, no more data coming
-					return
-				}
-				_ = s.stream.Send(&tunnelpb.ServerToClient{
-					StreamId: streamID,
-					Frame: &tunnelpb.ServerToClient_WindowUpdate{
-						WindowUpdate: windowUpdate,
-					},
-				})
-			},
-			initialWindowSize,
-		)
-	}
+	str.sender = newSender(ctx, frame.InitialWindowSize, s.tunnelOpts.maxChunkSize, sendFunc)
+	str.receiver = newReceiver(
+		func(m tunnelpb.ClientToServerFrame) uint {
+			switch m := m.(type) {
+			case *tunnelpb.ClientToServer_RequestMessage:
+				return uint(len(m.RequestMessage.Data))
+			case *tunnelpb.ClientToServer_MoreRequestData:
+				return uint(len(m.MoreRequestData))
+			default:
+				return 0
+			}
+		},
+		func(windowUpdate uint32) {
+			if str.loadHalfClosed() != nil {
+				// stream already half-closed, no more data coming
+				return
+			}
+			_ = s.stream.Send(&tunnelpb.ServerToClient{
+				StreamId: streamID,
+				Frame: &tunnelpb.ServerToClient_WindowUpdate{
+					WindowUpdate: windowUpdate,
+				},
+			})
+		},
+		s.tunnelOpts.initialWindowSize,
+	)
 
 	s.streams[streamID] = str
 	str.ctx = grpc.NewContextWithServerTransportStream(str.ctx, (*tunnelServerTransportStream)(str))
@@ -320,8 +319,8 @@ type tunnelServerStream struct {
 	isClientStream bool
 	isServerStream bool
 
-	sender     sender
-	receiver   receiver[tunnelpb.ClientToServerFrame]
+	sender     *sender
+	receiver   *receiver[tunnelpb.ClientToServerFrame]
 	halfClosed atomic.Pointer[errHolder]
 
 	// for reading frames from channel, to read message data

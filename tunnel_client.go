@@ -7,7 +7,6 @@ import (
 	"io"
 	"math"
 	"reflect"
-	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -26,9 +25,7 @@ import (
 // for issuing RPCs.
 func NewChannel(stub tunnelpb.TunnelServiceClient, opts ...TunnelOption) PendingChannel {
 	p := &pendingChannel{stub: stub}
-	for _, opt := range opts {
-		opt.apply(&p.opts)
-	}
+	initOptions(&p.opts, opts)
 	return p
 }
 
@@ -128,7 +125,7 @@ func (h *threadSafeOpenTunnelClient) Send(msg *tunnelpb.ClientToServer) error {
 	return h.TunnelService_OpenTunnelClient.Send(msg)
 }
 
-func (h *threadSafeOpenTunnelClient) SendMsg(msg any) error {
+func (h *threadSafeOpenTunnelClient) SendMsg(msg interface{}) error {
 	h.sendMu.Lock()
 	defer h.sendMu.Unlock()
 	return h.TunnelService_OpenTunnelClient.SendMsg(msg)
@@ -140,7 +137,7 @@ func (h *threadSafeOpenTunnelClient) Recv() (*tunnelpb.ServerToClient, error) {
 	return h.TunnelService_OpenTunnelClient.Recv()
 }
 
-func (h *threadSafeOpenTunnelClient) RecvMsg(msg any) error {
+func (h *threadSafeOpenTunnelClient) RecvMsg(msg interface{}) error {
 	h.recvMu.Lock()
 	defer h.recvMu.Unlock()
 	return h.TunnelService_OpenTunnelClient.RecvMsg(msg)
@@ -158,7 +155,7 @@ func (h *threadSafeOpenReverseTunnelServer) Send(msg *tunnelpb.ClientToServer) e
 	return h.TunnelService_OpenReverseTunnelServer.Send(msg)
 }
 
-func (h *threadSafeOpenReverseTunnelServer) SendMsg(msg any) error {
+func (h *threadSafeOpenReverseTunnelServer) SendMsg(msg interface{}) error {
 	h.sendMu.Lock()
 	defer h.sendMu.Unlock()
 	return h.TunnelService_OpenReverseTunnelServer.SendMsg(msg)
@@ -170,7 +167,7 @@ func (h *threadSafeOpenReverseTunnelServer) Recv() (*tunnelpb.ServerToClient, er
 	return h.TunnelService_OpenReverseTunnelServer.Recv()
 }
 
-func (h *threadSafeOpenReverseTunnelServer) RecvMsg(msg any) error {
+func (h *threadSafeOpenReverseTunnelServer) RecvMsg(msg interface{}) error {
 	h.recvMu.Lock()
 	defer h.recvMu.Unlock()
 	return h.TunnelService_OpenReverseTunnelServer.RecvMsg(msg)
@@ -187,7 +184,6 @@ type tunnelChannel struct {
 
 	awaitSettings chan struct{}
 	settings      *tunnelpb.Settings
-	useRevision   tunnelpb.ProtocolRevision
 
 	mu            sync.RWMutex
 	streams       map[int64]*tunnelClientStream
@@ -248,7 +244,7 @@ func (c *tunnelChannel) Close() {
 	c.close(nil)
 }
 
-func (c *tunnelChannel) Invoke(ctx context.Context, methodName string, req, resp any, opts ...grpc.CallOption) error {
+func (c *tunnelChannel) Invoke(ctx context.Context, methodName string, req, resp interface{}, opts ...grpc.CallOption) error {
 	str, err := c.newStream(ctx, false, false, methodName, opts...)
 	if err != nil {
 		return err
@@ -305,8 +301,8 @@ func (c *tunnelChannel) newStream(ctx context.Context, clientStreams, serverStre
 			NewStream: &tunnelpb.NewStream{
 				MethodName:        methodName,
 				RequestHeaders:    toProto(md),
-				ProtocolRevision:  c.useRevision,
-				InitialWindowSize: initialWindowSize,
+				ProtocolRevision:  tunnelpb.ProtocolRevision_REVISION_ONE,
+				InitialWindowSize: defaultInitialWindowSize,
 			},
 		},
 	})
@@ -425,37 +421,32 @@ func (c *tunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 			},
 		})
 	}
-	if c.useRevision == tunnelpb.ProtocolRevision_REVISION_ZERO {
-		str.sender = newSenderWithoutFlowControl(sendData)
-		str.receiver = newReceiverWithoutFlowControl[tunnelpb.ServerToClientFrame](ctx)
-	} else {
-		str.sender = newSender(ctx, c.settings.InitialWindowSize, sendData)
-		str.receiver = newReceiver(
-			func(frame tunnelpb.ServerToClientFrame) uint {
-				switch frame := frame.(type) {
-				case *tunnelpb.ServerToClient_ResponseMessage:
-					return uint(len(frame.ResponseMessage.Data))
-				case *tunnelpb.ServerToClient_MoreResponseData:
-					return uint(len(frame.MoreResponseData))
-				default:
-					return 0
-				}
-			},
-			func(windowUpdate uint32) {
-				if str.loadDone() != nil {
-					// don't bother with window updates; no more data coming
-					return
-				}
-				_ = c.stream.Send(&tunnelpb.ClientToServer{
-					StreamId: streamID,
-					Frame: &tunnelpb.ClientToServer_WindowUpdate{
-						WindowUpdate: windowUpdate,
-					},
-				})
-			},
-			initialWindowSize,
-		)
-	}
+	str.sender = newSender(ctx, c.settings.InitialWindowSize, c.tunnelOpts.maxChunkSize, sendData)
+	str.receiver = newReceiver(
+		func(frame tunnelpb.ServerToClientFrame) uint {
+			switch frame := frame.(type) {
+			case *tunnelpb.ServerToClient_ResponseMessage:
+				return uint(len(frame.ResponseMessage.Data))
+			case *tunnelpb.ServerToClient_MoreResponseData:
+				return uint(len(frame.MoreResponseData))
+			default:
+				return 0
+			}
+		},
+		func(windowUpdate uint32) {
+			if str.loadDone() != nil {
+				// don't bother with window updates; no more data coming
+				return
+			}
+			_ = c.stream.Send(&tunnelpb.ClientToServer{
+				StreamId: streamID,
+				Frame: &tunnelpb.ClientToServer_WindowUpdate{
+					WindowUpdate: windowUpdate,
+				},
+			})
+		},
+		c.tunnelOpts.initialWindowSize,
+	)
 
 	c.streams[streamID] = str
 
@@ -463,40 +454,45 @@ func (c *tunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 }
 
 func (c *tunnelChannel) recvLoop() {
-	if c.serverSendsSettings {
-		in, err := c.stream.Recv()
-		if err != nil {
-			c.close(fmt.Errorf("failed to read settings from server: %w", err))
-			return
-		}
-		if in.StreamId != -1 {
-			c.close(fmt.Errorf("protocol error: settings frame had bad stream ID (%d)", in.StreamId))
-			return
-		}
-		settings, ok := in.Frame.(*tunnelpb.ServerToClient_Settings)
-		if !ok {
-			c.close(fmt.Errorf("protocol error: first frame was not settings (instead was %T)", in.Frame))
-			return
-		}
-		supportedRevisions := c.tunnelOpts.supportedRevisions()
-		var supported bool
-		for _, rev := range settings.Settings.SupportedProtocolRevisions {
-			switch {
-			case slices.Contains(supportedRevisions, rev):
-				if rev > c.useRevision {
-					// use highest version that both server and client supports
-					c.useRevision = rev
-				}
-				supported = true
-			}
-		}
-		if !supported {
-			c.close(fmt.Errorf("protocol error: server support revisions %v, but client supports revisions %v",
-				settings.Settings.SupportedProtocolRevisions, supportedRevisions))
-			return
-		}
-		c.settings = settings.Settings
+	if !c.serverSendsSettings {
+		c.close(fmt.Errorf("protocol error: server only supports revision %v, but client only supports revision %v; upgrade server to v0.3 or later",
+			tunnelpb.ProtocolRevision_REVISION_ZERO, tunnelpb.ProtocolRevision_REVISION_ONE))
 	}
+	in, err := c.stream.Recv()
+	if err != nil {
+		c.close(fmt.Errorf("failed to read settings from server: %w", err))
+		return
+	}
+	if in.StreamId != -1 {
+		c.close(fmt.Errorf("protocol error: settings frame had bad stream ID (%d)", in.StreamId))
+		return
+	}
+	settings, ok := in.Frame.(*tunnelpb.ServerToClient_Settings)
+	if !ok {
+		c.close(fmt.Errorf("protocol error: first frame was not settings (instead was %T)", in.Frame))
+		return
+	}
+	var v0supported, v1supported bool
+	for _, rev := range settings.Settings.SupportedProtocolRevisions {
+		if rev == tunnelpb.ProtocolRevision_REVISION_ZERO {
+			v0supported = true
+		}
+		if rev == tunnelpb.ProtocolRevision_REVISION_ONE {
+			v1supported = true
+			break
+		}
+	}
+	if !v1supported {
+		if v0supported {
+			c.close(fmt.Errorf("protocol error: server supports revisions %v, but client only supports revision %v; upgrade server to v0.3 or later",
+				settings.Settings.SupportedProtocolRevisions, tunnelpb.ProtocolRevision_REVISION_ONE))
+		} else {
+			c.close(fmt.Errorf("protocol error: server supports revisions %v, but client only supports revision %v",
+				settings.Settings.SupportedProtocolRevisions, tunnelpb.ProtocolRevision_REVISION_ONE))
+		}
+		return
+	}
+	c.settings = settings.Settings
 	close(c.awaitSettings)
 
 	for {
@@ -513,6 +509,15 @@ func (c *tunnelChannel) recvLoop() {
 		}
 		str.acceptServerFrame(in.Frame)
 	}
+}
+
+func inSlice[S ~[]T, T comparable](find T, slice S) bool {
+	for _, elem := range slice {
+		if elem == find {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *tunnelChannel) getStream(streamID int64) (*tunnelClientStream, error) {
@@ -580,8 +585,8 @@ type tunnelClientStream struct {
 	isClientStream bool
 	isServerStream bool
 
-	sender   sender
-	receiver receiver[tunnelpb.ServerToClientFrame]
+	sender   *sender
+	receiver *receiver[tunnelpb.ServerToClientFrame]
 	done     atomic.Pointer[errHolder]
 
 	// for processing metadata frames, from receive loop
@@ -669,7 +674,7 @@ func (st *tunnelClientStream) Context() context.Context {
 	return st.ctx
 }
 
-func (st *tunnelClientStream) SendMsg(m any) error {
+func (st *tunnelClientStream) SendMsg(m interface{}) error {
 	st.writeMu.Lock()
 	defer st.writeMu.Unlock()
 
@@ -690,7 +695,7 @@ func (st *tunnelClientStream) SendMsg(m any) error {
 	return st.sender.send(b)
 }
 
-func (st *tunnelClientStream) RecvMsg(m any) error {
+func (st *tunnelClientStream) RecvMsg(m interface{}) error {
 	data, ok, err := st.readMsg()
 	if err != nil {
 		if !ok {

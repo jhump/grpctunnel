@@ -2,9 +2,10 @@ package grpctunnel
 
 import (
 	"context"
-	"google.golang.org/grpc/metadata"
 	"sync"
 	"sync/atomic"
+
+	"google.golang.org/grpc/metadata"
 
 	"github.com/fullstorydev/grpchan"
 	"google.golang.org/grpc"
@@ -70,10 +71,21 @@ type TunnelServiceHandlerOptions struct {
 	// server interceptors ran when the tunnel was opened, then any values they
 	// store in the context is also available.
 	AffinityKey func(TunnelChannel) any
+	// If non-zero, sets the initial flow control window size. If zero, the
+	// initial window size defaults to 64k. Increasing this may increase total
+	// throughput at the cost of more memory usage.
+	InitialWindowSize uint32
+	// If non-zero, sets the maximum size of a single chunk of data to send. This
+	// wil be clamped to the above window size if set to a larger value. If zero,
+	// the default max chunk size is 16k. Increasing this can allow larger messages
+	// to be sent more quickly (fewer chunks, fewer flow control messages) but at
+	// the potential cost of fairness, in the event that multiple streams are trying
+	// to concurrently send large messages.
+	MaxChunkSize uint32
 
-	// If true, flow control will be disabled, even when the network client
-	// supports flow control.
-	DisableFlowControl bool
+	// TODO: Option for minimum update size, so receiver can choose to batch
+	//       window updates, which can help throughput by eliminating some of
+	//       the bandwidth used for flow control messages.
 }
 
 // NewTunnelServiceHandler creates a new TunnelServiceHandler. The options are
@@ -84,7 +96,7 @@ type TunnelServiceHandlerOptions struct {
 // The handler's Service method can be used to actually register the handler
 // with a *grpc.Server (or other grpc.ServiceRegistrar).
 func NewTunnelServiceHandler(options TunnelServiceHandlerOptions) *TunnelServiceHandler {
-	return &TunnelServiceHandler{
+	handler := &TunnelServiceHandler{
 		handlers:                  grpchan.HandlerMap{},
 		noReverseTunnels:          options.NoReverseTunnels,
 		onReverseTunnelConnect:    options.OnReverseTunnelOpen,
@@ -93,9 +105,12 @@ func NewTunnelServiceHandler(options TunnelServiceHandlerOptions) *TunnelService
 		reverse:                   newReverseChannels(),
 		reverseByKey:              map[any]*reverseChannels{},
 		tunnelOpts: tunnelOpts{
-			disableFlowControl: options.DisableFlowControl,
+			initialWindowSize: options.InitialWindowSize,
+			maxChunkSize:      options.MaxChunkSize,
 		},
 	}
+	initOptions(&handler.tunnelOpts, nil)
+	return handler
 }
 
 var _ grpc.ServiceRegistrar = (*TunnelServiceHandler)(nil)

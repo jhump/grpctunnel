@@ -15,29 +15,20 @@ import (
 )
 
 const (
-	// TODO: make these configurable
-	initialWindowSize = 65536
-	chunkMax          = 16384
+	defaultInitialWindowSize = 65536
+	defaultChunkMax          = 16384
 )
 
 var errFlowControlWindowExceeded = status.Errorf(codes.ResourceExhausted, "flow control window exceeded")
 
 // sender is responsible for sending messages and managing flow control.
-type sender interface {
-	send(data []byte) error
-	updateWindow(add uint32)
-}
-
-// receiver is responsible for receiving messages and managing flow control.
-type receiver[T any] interface {
-	accept(item T) error
-	close()
-	cancel()
-	dequeue() (T, bool)
-}
-
-type defaultSender struct {
+// When sending data, it will not send more bytes than allowed by the current
+// flow control window. If more is to be sent, the operation will block until
+// the receiver acknowledges data and adds more capacity to the flow control
+// window.
+type sender struct {
 	ctx           context.Context
+	maxChunkSize  uint32
 	sendFunc      func([]byte, uint32, bool) error
 	windowUpdates chan struct{}
 	currentWindow atomic.Uint32
@@ -47,9 +38,10 @@ type defaultSender struct {
 	mu sync.Mutex
 }
 
-func newSender(ctx context.Context, initialWindowSize uint32, sendFunc func([]byte, uint32, bool) error) sender {
-	s := &defaultSender{
+func newSender(ctx context.Context, initialWindowSize, maxChunkSize uint32, sendFunc func([]byte, uint32, bool) error) *sender {
+	s := &sender{
 		ctx:           ctx,
+		maxChunkSize:  maxChunkSize,
 		sendFunc:      sendFunc,
 		windowUpdates: make(chan struct{}, 1),
 	}
@@ -57,12 +49,14 @@ func newSender(ctx context.Context, initialWindowSize uint32, sendFunc func([]by
 	return s
 }
 
-func (s *defaultSender) updateWindow(add uint32) {
+func (s *sender) updateWindow(add uint32) {
 	if add == 0 {
 		return
 	}
 	prevWindow := s.currentWindow.Add(add) - add
 	if prevWindow == 0 {
+		// Window changed from zero to non-zero, so unblock any sender
+		// that was waiting to send more data.
 		select {
 		case s.windowUpdates <- struct{}{}:
 		default:
@@ -70,7 +64,7 @@ func (s *defaultSender) updateWindow(add uint32) {
 	}
 }
 
-func (s *defaultSender) send(data []byte) error {
+func (s *sender) send(data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -92,7 +86,13 @@ func (s *defaultSender) send(data []byte) error {
 			continue
 		}
 
-		chunkSz := min(windowSz, uint32(len(data)), chunkMax)
+		chunkSz := windowSz
+		if chunkSz > uint32(len(data)) {
+			chunkSz = uint32(len(data))
+		}
+		if chunkSz > s.maxChunkSize {
+			chunkSz = s.maxChunkSize
+		}
 		if !s.currentWindow.CompareAndSwap(windowSz, windowSz-chunkSz) {
 			continue
 		}
@@ -110,8 +110,9 @@ func (s *defaultSender) send(data []byte) error {
 	}
 }
 
-// defaultReceiver is a per-stream queue of messages. When we receive a message for
-// a stream over a tunnel, we have to put them into this unbounded queue to prevent
+// receiver is responsible for receiving messages and managing flow control. It
+// holds a per-stream queue of messages. When we receive a message for a stream
+// over a tunnel, we have to put them into this unbounded queue to prevent
 // deadlock (where one consumer of a stream channel can block all operations on the
 // tunnel).
 //
@@ -119,7 +120,7 @@ func (s *defaultSender) send(data []byte) error {
 // backpressure to senders that are outpacing respective consumers. A well-behaved
 // sender will respect the flow control window. A misbehaving sender will be detected
 // and messages rejected if the flow control window is exceeded.
-type defaultReceiver[T any] struct {
+type receiver[T any] struct {
 	measure      func(T) uint
 	updateWindow func(uint32)
 
@@ -130,8 +131,8 @@ type defaultReceiver[T any] struct {
 	currentWindow     uint32
 }
 
-func newReceiver[T any](measure func(T) uint, updateWindow func(uint32), initialWindowSize uint32) receiver[T] {
-	rcvr := &defaultReceiver[T]{
+func newReceiver[T any](measure func(T) uint, updateWindow func(uint32), initialWindowSize uint32) *receiver[T] {
+	rcvr := &receiver[T]{
 		measure:       measure,
 		updateWindow:  updateWindow,
 		items:         list.New(),
@@ -141,7 +142,7 @@ func newReceiver[T any](measure func(T) uint, updateWindow func(uint32), initial
 	return rcvr
 }
 
-func (r *defaultReceiver[T]) accept(item T) error {
+func (r *receiver[T]) accept(item T) error {
 	sz := r.measure(item)
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -160,20 +161,20 @@ func (r *defaultReceiver[T]) accept(item T) error {
 	return nil
 }
 
-func (r *defaultReceiver[_]) close() {
+func (r *receiver[_]) close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.handleClosure(&r.closed)
 }
 
-func (r *defaultReceiver[_]) cancel() {
+func (r *receiver[_]) cancel() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.handleClosure(&r.cancelled)
 	r.items.Init() // clear list to free memory
 }
 
-func (r *defaultReceiver[_]) handleClosure(b *bool) {
+func (r *receiver[_]) handleClosure(b *bool) {
 	if *b {
 		return
 	}
@@ -183,7 +184,7 @@ func (r *defaultReceiver[_]) handleClosure(b *bool) {
 	}
 }
 
-func (r *defaultReceiver[T]) dequeue() (T, bool) {
+func (r *receiver[T]) dequeue() (T, bool) {
 	var windowUpdate uint
 	defer func() {
 		// TODO: Support minimum update size, so we can batch
@@ -212,104 +213,4 @@ func (r *defaultReceiver[T]) dequeue() (T, bool) {
 		}
 		r.cond.Wait()
 	}
-}
-
-type noFlowControlSender struct {
-	sendFunc func([]byte, uint32, bool) error
-
-	// does not protect any fields, just used to prevent concurrent calls to send
-	// (so messages are sent FIFO and not incorrectly interleaved)
-	mu sync.Mutex
-}
-
-func newSenderWithoutFlowControl(sendFunc func([]byte, uint32, bool) error) sender {
-	return &noFlowControlSender{sendFunc: sendFunc}
-}
-
-func (s *noFlowControlSender) send(data []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if int64(len(data)) > math.MaxUint32 {
-		return status.Errorf(codes.ResourceExhausted, "serialized message is too large: %d bytes > maximum %d bytes", len(data), math.MaxUint32)
-	}
-	size := uint32(len(data))
-	first := true
-	for {
-		chunkSz := min(uint32(chunkMax), uint32(len(data)))
-
-		last := chunkSz == uint32(len(data))
-		if err := s.sendFunc(data[:chunkSz], size, first); err != nil {
-			return err
-		}
-		if last {
-			return nil
-		}
-		first = false
-
-		data = data[chunkSz:]
-	}
-}
-
-func (s *noFlowControlSender) updateWindow(_ uint32) {
-	// should never actually be called
-}
-
-type noFlowControlReceiver[T any] struct {
-	ctx context.Context
-
-	ingestMu sync.Mutex
-	ch       chan T
-	closed   chan struct{}
-	doClose  sync.Once
-}
-
-func newReceiverWithoutFlowControl[T any](ctx context.Context) receiver[T] {
-	return &noFlowControlReceiver[T]{
-		ctx:    ctx,
-		ch:     make(chan T, 1),
-		closed: make(chan struct{}),
-	}
-}
-
-func (r *noFlowControlReceiver[T]) accept(item T) error {
-	r.ingestMu.Lock()
-	defer r.ingestMu.Unlock()
-
-	// First check closed channel. If already closed, we can't run select
-	// below because trying to write to closed channel r.ch will panic.
-	select {
-	case <-r.closed:
-		return nil
-	default:
-	}
-
-	select {
-	case r.ch <- item:
-	case <-r.closed:
-		// another thread intends to close; so abort and release the lock
-	}
-	return nil
-}
-
-func (r *noFlowControlReceiver[T]) close() {
-	r.doClose.Do(func() {
-		// Let any concurrent accepting thread know that we intend
-		// to close and thus need the lock.
-		close(r.closed)
-		// Must close the channel while lock is held to prevent
-		// panic in accept().
-		r.ingestMu.Lock()
-		defer r.ingestMu.Unlock()
-		close(r.ch)
-	})
-}
-
-func (r *noFlowControlReceiver[T]) cancel() {
-	r.close()
-}
-
-func (r *noFlowControlReceiver[T]) dequeue() (T, bool) {
-	t, ok := <-r.ch
-	return t, ok
 }

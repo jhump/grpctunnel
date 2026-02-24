@@ -2,6 +2,7 @@ package grpctunnel
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
 
@@ -47,9 +48,7 @@ func NewReverseTunnelServer(stub tunnelpb.TunnelServiceClient, opts ...TunnelOpt
 		handlers:  grpchan.HandlerMap{},
 		instances: map[tunnelpb.TunnelService_OpenReverseTunnelClient]struct{}{},
 	}
-	for _, opt := range opts {
-		opt.apply(&r.opts)
-	}
+	initOptions(&r.opts, opts)
 	return r
 }
 
@@ -109,7 +108,7 @@ func (s *ReverseTunnelServer) Serve(ctx context.Context, opts ...grpc.CallOption
 	}
 	defer s.wg.Done()
 	err = serveTunnel(stream, reqMD, clientAcceptsSettings, &s.opts, s.handlers, s.isClosing)
-	if err == context.Canceled && ctx.Err() == nil && s.isClosed() {
+	if errors.Is(err, context.Canceled) && ctx.Err() == nil && s.isClosed() {
 		// If we get back a cancelled error, but the given context is not
 		// cancelled and this server is closed, then the cancellation was
 		// caused by the server stopping. In that case, no need to report
