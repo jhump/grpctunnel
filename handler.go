@@ -71,21 +71,31 @@ type TunnelServiceHandlerOptions struct {
 	// server interceptors ran when the tunnel was opened, then any values they
 	// store in the context is also available.
 	AffinityKey func(TunnelChannel) any
-	// If non-zero, sets the initial flow control window size. If zero, the
+	// If non-zero, sets the initial flow control window size for receiving data.
+	// (The peer sets the initial window size for sending data.) If zero, the
 	// initial window size defaults to 64k. Increasing this may increase total
 	// throughput at the cost of more memory usage.
 	InitialWindowSize uint32
 	// If non-zero, sets the maximum size of a single chunk of data to send. This
-	// wil be clamped to the peer's initial window size if set to a larger value.
+	// will be clamped to the peer's initial window size if set to a larger value.
 	// If zero, the default max chunk size is 16k. Increasing this can allow larger
 	// messages to be sent more quickly (fewer chunks, fewer flow control messages)
 	// but at the potential cost of fairness, in the event that multiple streams
 	// are trying to concurrently send large messages.
 	MaxChunkSize uint32
-
-	// TODO: Option for minimum update size, so receiver can choose to batch
-	//       window updates, which can help throughput by eliminating some of
-	//       the bandwidth used for flow control messages.
+	// The minimum size for a flow control window update message. This will be
+	// clamped to the initial window size if set to a larger value. When receiving
+	// data, a window update will not be sent unless there is at least this amount
+	// outstanding (i.e. this many bytes to acknowledge). When unset or zero, this
+	// will default to 16k. When set to one, there is effectively no minimum, and an
+	// update window message will be sent for every chunk received, regardless of how
+	// small. (When RPC traffic consists of a lot of small messages, this can result
+	// in high bandwidth overhead for flow control management.) A larger value means
+	// fewer window update messages (and thus less overhead for flow control
+	// management), but too large a value, especially combined with RPC traffic that
+	// uses large messages, could mean an increase in latency while the sender waits
+	// for the large update window message before it can send more data.
+	MinWindowUpdateSize uint32
 }
 
 // NewTunnelServiceHandler creates a new TunnelServiceHandler. The options are

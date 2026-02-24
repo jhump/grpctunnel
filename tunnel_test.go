@@ -27,7 +27,7 @@ func TestTunnelServiceHandler(t *testing.T) {
 	var svr grpchantesting.TestServer
 	cli, ts := setupServer(t, &svr)
 	runTests(
-		context.Background(), t, modeRunNested, cli, ts, &svr,
+		t.Context(), t, modeRunNested, cli, ts, &svr,
 		func(_ context.Context, t *testing.T, ch grpc.ClientConnInterface) {
 			grpchantesting.RunChannelTestCases(t, ch, true)
 		},
@@ -51,8 +51,16 @@ func TestTunnelServiceHandler_Deadlocks(t *testing.T) {
 			opts: []TunnelOption{WithMaxChunkSize(1024 * 1024 * 1024)},
 		},
 		{
-			name: "both-overridden",
-			opts: []TunnelOption{WithInitialWindowSize(16 * 1024), WithMaxChunkSize(4 * 1024)},
+			name: "tiny-update",
+			opts: []TunnelOption{WithMinWindowUpdateSize(1)},
+		},
+		{
+			name: "oversized-update",
+			opts: []TunnelOption{WithMinWindowUpdateSize(1024 * 1024 * 1024)},
+		},
+		{
+			name: "all-overridden",
+			opts: []TunnelOption{WithInitialWindowSize(16 * 1024), WithMaxChunkSize(4 * 1024), WithMinWindowUpdateSize(4 * 1024)},
 		},
 	}
 	for _, tc := range testCases {
@@ -62,7 +70,7 @@ func TestTunnelServiceHandler_Deadlocks(t *testing.T) {
 			for _, tc := range testCases {
 				t.Run("client="+tc.name, func(t *testing.T) {
 					runTests(
-						context.Background(), t, modeRunNested, cli, ts, &svr,
+						t.Context(), t, modeRunNested, cli, ts, &svr,
 						func(ctx context.Context, t *testing.T, ch grpc.ClientConnInterface) {
 							runDeadlockTests(ctx, t, ch)
 						},
@@ -231,7 +239,7 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 	var svr grpchantesting.TestServer
 	tunnelCli, ts := setupServer(t, &svr)
 
-	forwardCh, err := NewChannel(tunnelCli).Start(context.Background())
+	forwardCh, err := NewChannel(tunnelCli).Start(t.Context())
 	require.NoError(t, err)
 	defer func() {
 		forwardCh.Close()
@@ -244,7 +252,7 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 	serveDone := make(chan struct{})
 	go func() {
 		defer close(serveDone)
-		started, err := revSvr.Serve(context.Background())
+		started, err := revSvr.Serve(t.Context())
 		assert.True(t, started, "ReverseTunnelServer.Serve returned false")
 		assert.NoError(t, err, "ReverseTunnelServer.Serve returned error")
 	}()
@@ -255,7 +263,7 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 
 	// make sure server has registered client, so we can issue RPCs to it
 	reverseCh := ts.AsChannel()
-	timedCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	timedCtx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	err = reverseCh.WaitForReady(timedCtx)
 	require.NoError(t, err, "reverse channel never became ready")
@@ -290,8 +298,10 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 						return
 					default:
 					}
-					_, err := cli.Unary(context.Background(), &grpchantesting.Message{})
-					require.NoError(t, err)
+					_, err := cli.Unary(t.Context(), &grpchantesting.Message{})
+					if !assert.NoError(t, err) {
+						return
+					}
 					atomic.AddInt32(&count, 1)
 				}
 			}

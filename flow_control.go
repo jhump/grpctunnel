@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	defaultInitialWindowSize = 65536
-	defaultChunkMax          = 16384
+	defaultInitialWindowSize = 64 * 1024
+	defaultChunkMax          = 16 * 1024
+	defaultUpdateMin         = 16 * 1024
 )
 
 var errFlowControlWindowExceeded = status.Errorf(codes.ResourceExhausted, "flow control window exceeded")
@@ -28,6 +29,7 @@ var errFlowControlWindowExceeded = status.Errorf(codes.ResourceExhausted, "flow 
 // window.
 type sender struct {
 	ctx           context.Context
+	streamName    string
 	maxChunkSize  uint32
 	sendFunc      func([]byte, uint32, bool) error
 	windowUpdates chan struct{}
@@ -38,12 +40,18 @@ type sender struct {
 	mu sync.Mutex
 }
 
-func newSender(ctx context.Context, initialWindowSize, maxChunkSize uint32, sendFunc func([]byte, uint32, bool) error) *sender {
+func newSender(
+	ctx context.Context,
+	initialWindowSize, maxChunkSize uint32,
+	sendFunc func([]byte, uint32, bool) error,
+	streamName string,
+) *sender {
 	if maxChunkSize > initialWindowSize {
 		maxChunkSize = initialWindowSize
 	}
 	s := &sender{
 		ctx:           ctx,
+		streamName:    streamName,
 		maxChunkSize:  maxChunkSize,
 		sendFunc:      sendFunc,
 		windowUpdates: make(chan struct{}, 1),
@@ -57,6 +65,7 @@ func (s *sender) updateWindow(add uint32) {
 		return
 	}
 	prevWindow := s.currentWindow.Add(add) - add
+	logSenderUpdate(s.streamName, add, prevWindow)
 	if prevWindow == 0 {
 		// Window changed from zero to non-zero, so unblock any sender
 		// that was waiting to send more data.
@@ -75,7 +84,7 @@ func (s *sender) send(data []byte) error {
 		return status.Errorf(codes.ResourceExhausted, "serialized message is too large: %d bytes > maximum %d bytes", len(data), math.MaxUint32)
 	}
 	size := uint32(len(data))
-	first := true
+	chunkIndex := 0
 	for {
 		windowSz := s.currentWindow.Load()
 
@@ -99,15 +108,16 @@ func (s *sender) send(data []byte) error {
 		if !s.currentWindow.CompareAndSwap(windowSz, windowSz-chunkSz) {
 			continue
 		}
+		logSend(s.streamName, chunkIndex, chunkSz, uint32(len(data)), windowSz)
 
 		last := chunkSz == uint32(len(data))
-		if err := s.sendFunc(data[:chunkSz], size, first); err != nil {
+		if err := s.sendFunc(data[:chunkSz], size, chunkIndex == 0); err != nil {
 			return err
 		}
 		if last {
 			return nil
 		}
-		first = false
+		chunkIndex++
 
 		data = data[chunkSz:]
 	}
@@ -124,20 +134,33 @@ func (s *sender) send(data []byte) error {
 // sender will respect the flow control window. A misbehaving sender will be detected
 // and messages rejected if the flow control window is exceeded.
 type receiver[T any] struct {
-	measure      func(T) uint
-	updateWindow func(uint32)
+	streamName    string
+	measure       func(T) uint
+	updateWindow  func(uint32)
+	minUpdateSize uint32
 
 	mu                sync.Mutex
 	cond              sync.Cond
 	closed, cancelled bool
 	items             *list.List
 	currentWindow     uint32
+	windowUpdate      uint32
 }
 
-func newReceiver[T any](measure func(T) uint, updateWindow func(uint32), initialWindowSize uint32) *receiver[T] {
+func newReceiver[T any](
+	measure func(T) uint,
+	updateWindow func(uint32),
+	initialWindowSize, minUpdateSize uint32,
+	streamName string,
+) *receiver[T] {
+	if minUpdateSize > initialWindowSize {
+		minUpdateSize = initialWindowSize
+	}
 	rcvr := &receiver[T]{
+		streamName:    streamName,
 		measure:       measure,
 		updateWindow:  updateWindow,
+		minUpdateSize: minUpdateSize,
 		items:         list.New(),
 		currentWindow: initialWindowSize,
 	}
@@ -147,11 +170,15 @@ func newReceiver[T any](measure func(T) uint, updateWindow func(uint32), initial
 
 func (r *receiver[T]) accept(item T) error {
 	sz := r.measure(item)
+	if sz == 0 {
+		return nil
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return nil
 	}
+	logReceive(r.streamName, sz, r.currentWindow)
 	if sz > uint(r.currentWindow) {
 		return errFlowControlWindowExceeded
 	}
@@ -188,12 +215,10 @@ func (r *receiver[_]) handleClosure(b *bool) {
 }
 
 func (r *receiver[T]) dequeue() (T, bool) {
-	var windowUpdate uint
+	var sendUpdate uint32
 	defer func() {
-		// TODO: Support minimum update size, so we can batch
-		//       updates and send fewer messages over the network.
-		if windowUpdate > 0 {
-			r.updateWindow(uint32(windowUpdate))
+		if sendUpdate > 0 {
+			r.updateWindow(sendUpdate)
 		}
 	}()
 	r.mu.Lock()
@@ -207,8 +232,15 @@ func (r *receiver[T]) dequeue() (T, bool) {
 		if element != nil {
 			item := r.items.Remove(element).(T)
 			sz := r.measure(item)
-			r.currentWindow += uint32(sz)
-			windowUpdate = sz
+			newWindowUpdate := r.windowUpdate + uint32(sz)
+			doSend := newWindowUpdate >= r.minUpdateSize
+			logReceiverAck(r.streamName, sz, newWindowUpdate, r.currentWindow, doSend)
+			if doSend {
+				r.currentWindow += newWindowUpdate
+				sendUpdate = newWindowUpdate
+				newWindowUpdate = 0
+			}
+			r.windowUpdate = newWindowUpdate
 			return item, true
 		}
 		if r.closed {

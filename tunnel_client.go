@@ -302,7 +302,7 @@ func (c *tunnelChannel) newStream(ctx context.Context, clientStreams, serverStre
 				MethodName:        methodName,
 				RequestHeaders:    toProto(md),
 				ProtocolRevision:  tunnelpb.ProtocolRevision_REVISION_ONE,
-				InitialWindowSize: defaultInitialWindowSize,
+				InitialWindowSize: c.tunnelOpts.initialWindowSize,
 			},
 		},
 	})
@@ -421,7 +421,8 @@ func (c *tunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 			},
 		})
 	}
-	str.sender = newSender(ctx, c.settings.InitialWindowSize, c.tunnelOpts.maxChunkSize, sendData)
+	streamName := fmt.Sprintf("%p:cli<%d>", c, streamID)
+	str.sender = newSender(ctx, c.settings.InitialWindowSize, c.tunnelOpts.maxChunkSize, sendData, streamName+"req")
 	str.receiver = newReceiver(
 		func(frame tunnelpb.ServerToClientFrame) uint {
 			switch frame := frame.(type) {
@@ -446,6 +447,8 @@ func (c *tunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 			})
 		},
 		c.tunnelOpts.initialWindowSize,
+		c.tunnelOpts.minWindowUpdateSize,
+		streamName+"resp",
 	)
 
 	c.streams[streamID] = str

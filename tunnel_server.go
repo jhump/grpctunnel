@@ -64,7 +64,7 @@ func (s *tunnelServer) serve(tunnelMetadata metadata.MD) error {
 			StreamId: -1,
 			Frame: &tunnelpb.ServerToClient_Settings{
 				Settings: &tunnelpb.Settings{
-					InitialWindowSize:          defaultInitialWindowSize,
+					InitialWindowSize:          s.tunnelOpts.initialWindowSize,
 					SupportedProtocolRevisions: []tunnelpb.ProtocolRevision{tunnelpb.ProtocolRevision_REVISION_ONE},
 				},
 			},
@@ -202,7 +202,8 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 			},
 		})
 	}
-	str.sender = newSender(ctx, frame.InitialWindowSize, s.tunnelOpts.maxChunkSize, sendFunc)
+	streamName := fmt.Sprintf("svr@%p:<%d>", s, streamID)
+	str.sender = newSender(ctx, frame.InitialWindowSize, s.tunnelOpts.maxChunkSize, sendFunc, streamName+"resp")
 	str.receiver = newReceiver(
 		func(m tunnelpb.ClientToServerFrame) uint {
 			switch m := m.(type) {
@@ -227,6 +228,8 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 			})
 		},
 		s.tunnelOpts.initialWindowSize,
+		s.tunnelOpts.minWindowUpdateSize,
+		streamName+"req",
 	)
 
 	s.streams[streamID] = str
