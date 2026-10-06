@@ -145,6 +145,10 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 	}
 	s.lastSeen = streamID
 
+	if frame.InitialWindowSize == 0 {
+		// The sender could never send any data to the client.
+		return true, status.Errorf(codes.Internal, "protocol error: client sent invalid initial window size of zero")
+	}
 	if frame.MethodName[0] == '/' {
 		frame.MethodName = frame.MethodName[1:]
 	}

@@ -500,6 +500,11 @@ func (c *tunnelChannel) recvLoop() {
 		}
 		return
 	}
+	if settings.Settings.InitialWindowSize == 0 {
+		// Streams could never send any data to the server.
+		c.close(errors.New("protocol error: server sent invalid initial window size of zero"))
+		return
+	}
 	c.settings = settings.Settings
 	close(c.awaitSettings)
 
