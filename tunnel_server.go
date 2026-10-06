@@ -121,16 +121,9 @@ func (s *tunnelServer) serve(tunnelMetadata metadata.MD) error {
 // itself is still valid for subsequent RPCs. This will be the case, for example, if the requested
 // method name is not implemented by the server.
 func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *tunnelpb.NewStream) (bool, error) {
-	if s.isClosing() {
-		return true, status.Errorf(codes.Unavailable, "server is shutting down")
-	}
-
-	if frame.ProtocolRevision == tunnelpb.ProtocolRevision_REVISION_ZERO {
-		return true, status.Errorf(codes.Unavailable, "server does not support protocol revision %d anymore; upgrade client to v0.3 or later", frame.ProtocolRevision)
-	}
-	if frame.ProtocolRevision != tunnelpb.ProtocolRevision_REVISION_ONE {
-		return true, status.Errorf(codes.Unavailable, "server does not support protocol revision %d", frame.ProtocolRevision)
-	}
+	// Checked before acquiring s.mu, so we never hold s.mu while acquiring
+	// whatever lock isClosing may need.
+	closing := s.isClosing()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -143,15 +136,26 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 	if streamID <= s.lastSeen {
 		return false, fmt.Errorf("cannot create stream ID %d: that ID has already been used", streamID)
 	}
+	// This must be recorded before any of the checks below that reject only
+	// this stream. Otherwise, subsequent frames that the client sends for the
+	// rejected stream would look like frames for a stream that was never
+	// created, which is a protocol error that tears down the whole tunnel.
 	s.lastSeen = streamID
 
+	if closing {
+		return true, status.Errorf(codes.Unavailable, "server is shutting down")
+	}
+	if frame.ProtocolRevision == tunnelpb.ProtocolRevision_REVISION_ZERO {
+		return true, status.Errorf(codes.Unavailable, "server does not support protocol revision %d anymore; upgrade client to v0.3 or later", frame.ProtocolRevision)
+	}
+	if frame.ProtocolRevision != tunnelpb.ProtocolRevision_REVISION_ONE {
+		return true, status.Errorf(codes.Unavailable, "server does not support protocol revision %d", frame.ProtocolRevision)
+	}
 	if frame.InitialWindowSize == 0 {
 		// The sender could never send any data to the client.
 		return true, status.Errorf(codes.Internal, "protocol error: client sent invalid initial window size of zero")
 	}
-	if frame.MethodName[0] == '/' {
-		frame.MethodName = frame.MethodName[1:]
-	}
+	frame.MethodName = strings.TrimPrefix(frame.MethodName, "/")
 	parts := strings.SplitN(frame.MethodName, "/", 2)
 	if len(parts) != 2 {
 		return true, status.Errorf(codes.InvalidArgument, "%s is not a well-formed method name", frame.MethodName)
