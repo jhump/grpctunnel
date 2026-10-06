@@ -157,14 +157,14 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 		if s.clientAcceptsSettings {
 			// The client negotiated but still chose revision zero. Only v0.3
 			// does that, and only when flow control is disabled.
-			return true, status.Errorf(codes.Unavailable, "%s does not support protocol revision %d anymore; %s must not disable flow control",
+			return true, status.Errorf(codes.FailedPrecondition, "%s does not support protocol revision %d anymore; %s must not disable flow control",
 				self, frame.ProtocolRevision, peer)
 		}
-		return true, status.Errorf(codes.Unavailable, "%s does not support protocol revision %d anymore; upgrade %s to v0.3 or later",
+		return true, status.Errorf(codes.FailedPrecondition, "%s does not support protocol revision %d anymore; upgrade %s to v0.3 or later",
 			self, frame.ProtocolRevision, peer)
 	}
 	if !slices.Contains(supportedRevisions, frame.ProtocolRevision) {
-		return true, status.Errorf(codes.Unavailable, "%s does not support protocol revision %d", self, frame.ProtocolRevision)
+		return true, status.Errorf(codes.FailedPrecondition, "%s does not support protocol revision %d", self, frame.ProtocolRevision)
 	}
 	if minWindow := minWindowSize(frame.ProtocolRevision); frame.InitialWindowSize < minWindow {
 		// The sender could never send any data to the client.

@@ -77,6 +77,10 @@ func (s *ReverseTunnelServer) RegisterService(desc *grpc.ServiceDesc, srv any) {
 // This will be nil if the stream was closed by the other side of the tunnel
 // (the server, acting as an RPC client, hanging up).
 //
+// The given context defines the lifetime of the tunnel. To limit how long it
+// can take to establish the tunnel, use the WithEstablishmentTimeout option
+// when creating the server.
+//
 // Reasons for the tunnel ending abnormally include detection of invalid usage
 // of the stream (RPC client sending references to invalid stream IDs or sending
 // frames for a stream ID in improper order) or if the stream itself fails (for
@@ -88,12 +92,17 @@ func (s *ReverseTunnelServer) RegisterService(desc *grpc.ServiceDesc, srv any) {
 func (s *ReverseTunnelServer) Serve(ctx context.Context, opts ...grpc.CallOption) (started bool, err error) {
 	// TODO: validate options and maybe return an error
 	ctx = metadata.AppendToOutgoingContext(ctx, grpctunnelNegotiateKey, grpctunnelNegotiateVal)
-	stream, err := s.stub.OpenReverseTunnel(ctx, opts...)
+	_, peer := tunnelRoles(true)
+	streamCtx, est := startEstablishment(ctx, s.opts.establishmentTimeout, peer)
+	// By the time this returns, the RPC has either finished or is being
+	// abandoned (if the tunnel couldn't be started), so it can be cancelled.
+	defer est.release()
+	stream, err := s.stub.OpenReverseTunnel(streamCtx, opts...)
 	if err != nil {
-		return false, err
+		return false, est.done(err)
 	}
 	respMD, err := stream.Header()
-	if err != nil {
+	if err := est.done(err); err != nil {
 		return false, err
 	}
 	vals := respMD.Get(grpctunnelNegotiateKey)

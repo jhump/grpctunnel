@@ -37,6 +37,8 @@ func NewChannel(stub tunnelpb.TunnelServiceClient, opts ...TunnelOption) Pending
 //
 // The given context defines the lifetime of the stream and therefore of the
 // channel; if the context times out or is cancelled, the channel will be closed.
+// To limit how long it can take to establish the tunnel, use the
+// WithEstablishmentTimeout option when creating the channel.
 type PendingChannel interface {
 	Start(ctx context.Context, opts ...grpc.CallOption) (TunnelChannel, error)
 }
@@ -49,19 +51,34 @@ type pendingChannel struct {
 func (p *pendingChannel) Start(ctx context.Context, opts ...grpc.CallOption) (TunnelChannel, error) {
 	// TODO: validate options and maybe return an error
 	ctx = metadata.AppendToOutgoingContext(ctx, grpctunnelNegotiateKey, grpctunnelNegotiateVal)
+	peer, _ := tunnelRoles(false)
+	ctx, est := startEstablishment(ctx, p.opts.establishmentTimeout, peer)
 	stream, err := p.stub.OpenTunnel(ctx, opts...)
 	if err != nil {
+		err = est.done(err)
+		est.release()
 		return nil, err
 	}
 	respMD, err := stream.Header()
 	if err != nil {
+		err = est.done(err)
+		est.release()
 		return nil, err
 	}
+	// The stream's context is cancelled when the RPC finishes.
+	context.AfterFunc(stream.Context(), est.release)
 	vals := respMD.Get(grpctunnelNegotiateKey)
 	serverSendsSettings := len(vals) > 0 && vals[0] == grpctunnelNegotiateVal
 	reqMD, _ := metadata.FromOutgoingContext(stream.Context())
 	stream = &threadSafeOpenTunnelClient{TunnelService_OpenTunnelClient: stream}
-	return newTunnelChannel(stream, reqMD, serverSendsSettings, false, &p.opts, func(*tunnelChannel) { _ = stream.CloseSend() }), nil
+	// This waits for the server's settings, so the tunnel is established
+	// when this returns.
+	ch := newTunnelChannel(stream, reqMD, serverSendsSettings, false, &p.opts, func(*tunnelChannel) { _ = stream.CloseSend() })
+	if err := est.done(nil); err != nil {
+		ch.Close()
+		return nil, err
+	}
+	return ch, nil
 }
 
 func newReverseChannel(stream tunnelpb.TunnelService_OpenReverseTunnelServer, opts *tunnelOpts, onClose func(*tunnelChannel)) *tunnelChannel {

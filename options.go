@@ -1,5 +1,9 @@
 package grpctunnel
 
+import "time"
+
+const defaultEstablishmentTimeout = 15 * time.Second
+
 // TunnelOption is an option for configuring the behavior of
 // a tunnel client or tunnel server.
 type TunnelOption interface {
@@ -49,10 +53,34 @@ func WithMinWindowUpdateSize(size uint32) TunnelOption {
 	})
 }
 
+// WithEstablishmentTimeout limits how long it can take to establish a tunnel,
+// for both channels created with NewChannel and reverse tunnels served by a
+// ReverseTunnelServer. Establishing a tunnel involves opening the RPC stream
+// that carries it and waiting for the peer to respond. If the tunnel is not
+// established within this time, the attempt fails with a FailedPrecondition
+// error.
+//
+// The context given to PendingChannel.Start or ReverseTunnelServer.Serve can't
+// be used for this since it controls the lifetime of the entire tunnel, not
+// just how long it takes to establish it.
+//
+// If this option is not used, the default timeout is 15 seconds. If this option
+// is used with a value of zero or less, there is no limit.
+func WithEstablishmentTimeout(timeout time.Duration) TunnelOption {
+	if timeout <= 0 {
+		// Zero means to use the default, so use a negative value for no limit.
+		timeout = -1
+	}
+	return tunnelOptFunc(func(t *tunnelOpts) {
+		t.establishmentTimeout = timeout
+	})
+}
+
 type tunnelOpts struct {
-	initialWindowSize   uint32
-	maxChunkSize        uint32
-	minWindowUpdateSize uint32
+	initialWindowSize    uint32
+	maxChunkSize         uint32
+	minWindowUpdateSize  uint32
+	establishmentTimeout time.Duration
 }
 
 func initOptions(t *tunnelOpts, opts []TunnelOption) {
@@ -69,6 +97,9 @@ func initOptions(t *tunnelOpts, opts []TunnelOption) {
 	}
 	if t.minWindowUpdateSize == 0 {
 		t.minWindowUpdateSize = defaultUpdateMin
+	}
+	if t.establishmentTimeout == 0 {
+		t.establishmentTimeout = defaultEstablishmentTimeout
 	}
 }
 

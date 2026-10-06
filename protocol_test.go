@@ -110,7 +110,7 @@ func TestTunnelServer_RejectsRevisionZeroClientPerStream(t *testing.T) {
 		closeStream, ok := in.Frame.(*tunnelpb.ServerToClient_CloseStream)
 		require.True(t, ok, "expected CloseStream frame, got %T", in.Frame)
 		st := status.FromProto(closeStream.CloseStream.Status)
-		require.Equal(t, codes.Unavailable, st.Code())
+		require.Equal(t, codes.FailedPrecondition, st.Code())
 		require.Contains(t, st.Message(), "server does not support protocol revision 0 anymore; upgrade client to v0.3 or later")
 	}
 }
@@ -135,7 +135,7 @@ func TestReverseTunnelServer_RejectsRevisionZeroPeerPerStream(t *testing.T) {
 
 	select {
 	case st := <-fakeSvr.result:
-		require.Equal(t, codes.Unavailable, st.Code())
+		require.Equal(t, codes.FailedPrecondition, st.Code())
 		require.Contains(t, st.Message(), "tunnel server (network client) does not support protocol revision 0 anymore; "+
 			"upgrade tunnel client (network server) to v0.3 or later")
 	case <-time.After(5 * time.Second):
@@ -241,13 +241,13 @@ func TestTunnelServer_RejectsBadNewStream(t *testing.T) {
 			// like a v0.3 client with flow control disabled
 			name:       "revision-zero",
 			modify:     func(ns *tunnelpb.NewStream) { ns.ProtocolRevision = tunnelpb.ProtocolRevision_REVISION_ZERO },
-			expectCode: codes.Unavailable,
+			expectCode: codes.FailedPrecondition,
 			expectMsg:  "server does not support protocol revision 0 anymore; client must not disable flow control",
 		},
 		{
 			name:       "unknown-revision",
 			modify:     func(ns *tunnelpb.NewStream) { ns.ProtocolRevision = 99 },
-			expectCode: codes.Unavailable,
+			expectCode: codes.FailedPrecondition,
 			expectMsg:  "does not support protocol revision 99",
 		},
 		{
