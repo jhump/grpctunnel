@@ -3,6 +3,9 @@ package grpctunnel
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net"
 	"runtime"
 	"sync"
@@ -355,6 +358,44 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 			t.Logf("RPCs sent: %d", count.Load())
 		})
 	}
+}
+
+func TestTunnelServiceHandler_TrailersAvailableAtEOF(t *testing.T) {
+	// Regression test: trailers must be available as soon as the client
+	// observes the end of the stream. Previously, the end of the stream could
+	// be observed slightly before trailers were recorded.
+	var svr grpchantesting.TestServer
+	tunnelCli, _ := setupInProcessServer(&svr)
+	ch, err := NewChannel(tunnelCli).Start(t.Context())
+	require.NoError(t, err)
+	defer func() {
+		ch.Close()
+		<-ch.Done()
+	}()
+	stub := grpchantesting.NewTestServiceClient(ch)
+	// The race window is narrow, so we use lots of concurrent RPCs to make
+	// it more likely to be hit.
+	grp, ctx := errgroup.WithContext(t.Context())
+	for range 20 {
+		grp.Go(func() error {
+			for range 500 {
+				stream, err := stub.ServerStream(ctx, &grpchantesting.Message{
+					Trailers: map[string][]byte{"foo": []byte("bar")},
+				})
+				if err != nil {
+					return err
+				}
+				if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
+					return fmt.Errorf("expected EOF, got %w", err)
+				}
+				if trailer := stream.Trailer().Get("foo"); len(trailer) != 1 || trailer[0] != "bar" {
+					return fmt.Errorf("wrong trailer at EOF: %v", trailer)
+				}
+			}
+			return nil
+		})
+	}
+	require.NoError(t, grp.Wait())
 }
 
 // TODO: also need more tests around channel lifecycle, and ensuring it

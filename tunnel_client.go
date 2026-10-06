@@ -856,7 +856,7 @@ func (st *tunnelClientStream) finishStream(err error, trailers metadata.MD) bool
 	}
 	defer st.cancel()
 	st.ch.removeStream(st.streamID)
-	st.receiver.close()
+	defer st.receiver.close()
 
 	st.metaMu.Lock()
 	defer st.metaMu.Unlock()
