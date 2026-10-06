@@ -29,7 +29,7 @@ vet:
 
 .PHONY: staticcheck
 staticcheck:
-	@go install honnef.co/go/tools/cmd/staticcheck@v0.6.1
+	@go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
 	staticcheck ./...
 
 .PHONY: ineffassign
@@ -44,7 +44,7 @@ golint:
 
 .PHONY: errcheck
 errcheck:
-	@go install github.com/kisielk/errcheck@v1.9.0
+	@go install github.com/kisielk/errcheck@v1.20.0
 	errcheck ./...
 
 .PHONY: test

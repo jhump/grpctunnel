@@ -148,7 +148,7 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 	if len(parts) != 2 {
 		return true, status.Errorf(codes.InvalidArgument, "%s is not a well-formed method name", frame.MethodName)
 	}
-	var md interface{}
+	var md any
 	sd, svc := s.services.QueryService(parts[0])
 	if sd != nil {
 		md = findMethod(sd, parts[1])
@@ -291,7 +291,7 @@ func (s *tunnelServer) removeStream(streamID int64) {
 	delete(s.streams, streamID)
 }
 
-func findMethod(sd *grpc.ServiceDesc, method string) interface{} {
+func findMethod(sd *grpc.ServiceDesc, method string) any {
 	for i, md := range sd.Methods {
 		if md.MethodName == method {
 			return &sd.Methods[i]
@@ -448,7 +448,7 @@ func (st *tunnelServerStream) Context() context.Context {
 	return st.ctx
 }
 
-func (st *tunnelServerStream) SendMsg(m interface{}) error {
+func (st *tunnelServerStream) SendMsg(m any) error {
 	st.writeMu.Lock()
 	defer st.writeMu.Unlock()
 
@@ -475,7 +475,7 @@ func (st *tunnelServerStream) SendMsg(m interface{}) error {
 	return st.sender.send(b)
 }
 
-func (st *tunnelServerStream) RecvMsg(m interface{}) error {
+func (st *tunnelServerStream) RecvMsg(m any) error {
 	data, ok, err := st.readMsg()
 	if err != nil {
 		if !ok {
@@ -569,7 +569,7 @@ func (st *tunnelServerStream) readMsgLocked() (data []byte, ok bool, err error) 
 	}
 }
 
-func (st *tunnelServerStream) serveStream(md interface{}, srv interface{}) {
+func (st *tunnelServerStream) serveStream(md any, srv any) {
 	var err error
 	panicked := true // pessimistic assumption
 
@@ -588,7 +588,7 @@ func (st *tunnelServerStream) serveStream(md interface{}, srv interface{}) {
 
 	switch md := md.(type) {
 	case *grpc.MethodDesc:
-		var resp interface{}
+		var resp any
 		resp, err = md.Handler(srv, st.ctx, st.RecvMsg, nil)
 		if err == nil {
 			err = st.SendMsg(resp)

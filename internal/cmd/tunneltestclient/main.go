@@ -112,7 +112,7 @@ func makeClientKey() (string, error) {
 func withClientCounts(ch grpc.ClientConnInterface, counts *atomic.Int32) grpc.ClientConnInterface {
 	return grpchan.InterceptClientConn(
 		ch,
-		func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 			counts.Add(1)
 			return invoker(ctx, method, req, reply, cc, opts...)
 		},
@@ -126,11 +126,11 @@ func withClientCounts(ch grpc.ClientConnInterface, counts *atomic.Int32) grpc.Cl
 func withServerCounts(reg grpc.ServiceRegistrar, counts *atomic.Int32) grpc.ServiceRegistrar {
 	return grpchan.WithInterceptor(
 		reg,
-		func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+		func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
 			counts.Add(1)
 			return handler(ctx, req)
 		},
-		func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 			counts.Add(1)
 			return handler(srv, ss)
 		},

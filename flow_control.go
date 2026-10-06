@@ -92,13 +92,7 @@ func (s *defaultSender) send(data []byte) error {
 			continue
 		}
 
-		chunkSz := windowSz
-		if chunkSz > uint32(len(data)) {
-			chunkSz = uint32(len(data))
-		}
-		if chunkSz > chunkMax {
-			chunkSz = chunkMax
-		}
+		chunkSz := min(windowSz, uint32(len(data)), chunkMax)
 		if !s.currentWindow.CompareAndSwap(windowSz, windowSz-chunkSz) {
 			continue
 		}
@@ -242,10 +236,7 @@ func (s *noFlowControlSender) send(data []byte) error {
 	size := uint32(len(data))
 	first := true
 	for {
-		chunkSz := uint32(chunkMax)
-		if chunkSz > uint32(len(data)) {
-			chunkSz = uint32(len(data))
-		}
+		chunkSz := min(uint32(chunkMax), uint32(len(data)))
 
 		last := chunkSz == uint32(len(data))
 		if err := s.sendFunc(data[:chunkSz], size, first); err != nil {

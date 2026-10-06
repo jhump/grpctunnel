@@ -21,7 +21,6 @@ func SendRPCs(ctx context.Context, client grpchantesting.TestServiceClient) erro
 	grp, ctx := errgroup.WithContext(ctx)
 	type action func(context.Context, grpchantesting.TestServiceClient) error
 	for _, fn := range []action{doUnary, doClientStream, doServerStream, doBidiStream} {
-		fn := fn
 		grp.Go(func() error {
 			for {
 				if done.Load() {
@@ -52,7 +51,7 @@ func doClientStream(ctx context.Context, client grpchantesting.TestServiceClient
 	if err != nil {
 		return err
 	}
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		err := stream.Send(&grpchantesting.Message{
 			Count:   10,
 			Payload: bytes.Repeat([]byte{0, 1, 2, 3}, 10000),
@@ -90,7 +89,7 @@ func doBidiStream(ctx context.Context, client grpchantesting.TestServiceClient) 
 		return err
 	}
 	go func() {
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			err := stream.Send(&grpchantesting.Message{
 				Count:   10,
 				Payload: bytes.Repeat([]byte{0, 1, 2, 3}, 1000),
