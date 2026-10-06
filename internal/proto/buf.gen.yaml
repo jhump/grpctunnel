@@ -1,8 +1,8 @@
-version: v1
+version: v2
 plugins:
-  - plugin: buf.build/protocolbuffers/go:v1.36.9
+  - remote: buf.build/protocolbuffers/go:v1.36.12
     out: ../
-    opt: [Mgrpctunnel/testing/testing.proto=./gen]
-  - plugin: buf.build/grpc/go:v1.5.1
+    opt: Mgrpctunnel/testing/testing.proto=./gen
+  - remote: buf.build/grpc/go:v1.6.2
     out: ../
-    opt: [Mgrpctunnel/testing/testing.proto=./gen]
+    opt: Mgrpctunnel/testing/testing.proto=./gen

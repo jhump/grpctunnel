@@ -1,9 +1,6 @@
-version: v1
+version: v2
 deps:
   - buf.build/googleapis/googleapis
-breaking:
-  use:
-    - FILE
 lint:
   use:
     - DEFAULT
@@ -17,3 +14,6 @@ lint:
     # lint and can't be changed without breaking generated code
     - ENUM_VALUE_PREFIX
     - ENUM_ZERO_VALUE_SUFFIX
+breaking:
+  use:
+    - FILE
