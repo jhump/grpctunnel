@@ -42,7 +42,7 @@ type TunnelServiceHandler struct {
 	reverse  *reverseChannels
 
 	mu           sync.RWMutex
-	reverseByKey map[interface{}]*reverseChannels
+	reverseByKey map[any]*reverseChannels
 }
 
 // TunnelServiceHandlerOptions contains various fields that can be used to
@@ -91,7 +91,7 @@ func NewTunnelServiceHandler(options TunnelServiceHandlerOptions) *TunnelService
 		onReverseTunnelDisconnect: options.OnReverseTunnelClose,
 		affinityKey:               options.AffinityKey,
 		reverse:                   newReverseChannels(),
-		reverseByKey:              map[interface{}]*reverseChannels{},
+		reverseByKey:              map[any]*reverseChannels{},
 		tunnelOpts: tunnelOpts{
 			disableFlowControl: options.DisableFlowControl,
 		},
@@ -103,7 +103,7 @@ var _ grpc.ServiceRegistrar = (*TunnelServiceHandler)(nil)
 // RegisterService implements the [grpc.ServiceRegistrar] interface. This allows
 // the handler to be passed to generated registration functions, so service
 // implementations can be registered with the handler.
-func (s *TunnelServiceHandler) RegisterService(desc *grpc.ServiceDesc, srv interface{}) {
+func (s *TunnelServiceHandler) RegisterService(desc *grpc.ServiceDesc, srv any) {
 	s.handlers.RegisterService(desc, srv)
 }
 
@@ -166,7 +166,7 @@ func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_O
 	ch := newReverseChannel(stream, &s.tunnelOpts, s.unregister)
 	defer ch.Close()
 
-	var key interface{}
+	var key any
 	if s.affinityKey != nil {
 		key = s.affinityKey(ch)
 	}
@@ -349,7 +349,7 @@ func (s *TunnelServiceHandler) AsChannel() ReverseClientConnInterface {
 //
 // This method panics if the handler was created with an option to disallow the
 // use of reverse tunnels.
-func (s *TunnelServiceHandler) KeyAsChannel(key interface{}) ReverseClientConnInterface {
+func (s *TunnelServiceHandler) KeyAsChannel(key any) ReverseClientConnInterface {
 	if s.noReverseTunnels {
 		panic("reverse tunnels not supported")
 	}
@@ -366,7 +366,7 @@ func (s *TunnelServiceHandler) KeyAsChannel(key interface{}) ReverseClientConnIn
 	}
 }
 
-func (s *TunnelServiceHandler) pickKey(key interface{}) grpc.ClientConnInterface {
+func (s *TunnelServiceHandler) pickKey(key any) grpc.ClientConnInterface {
 	s.mu.RLock()
 	rc := s.reverseByKey[key]
 	s.mu.RUnlock()
@@ -377,7 +377,7 @@ func (s *TunnelServiceHandler) pickKey(key interface{}) grpc.ClientConnInterface
 	return rc.pick()
 }
 
-func (s *TunnelServiceHandler) keyIsReady(key interface{}) bool {
+func (s *TunnelServiceHandler) keyIsReady(key any) bool {
 	s.mu.RLock()
 	rc := s.reverseByKey[key]
 	s.mu.RUnlock()
@@ -388,7 +388,7 @@ func (s *TunnelServiceHandler) keyIsReady(key interface{}) bool {
 	return rc.ready()
 }
 
-func (s *TunnelServiceHandler) waitForKeyReady(ctx context.Context, key interface{}) error {
+func (s *TunnelServiceHandler) waitForKeyReady(ctx context.Context, key any) error {
 	rc := s.reverseChannelsForKey(key)
 	return rc.waitForReady(ctx)
 }
@@ -427,7 +427,7 @@ type multiChannel struct {
 	waitForReady func(context.Context) error
 }
 
-func (c multiChannel) Invoke(ctx context.Context, methodName string, req, resp interface{}, opts ...grpc.CallOption) error {
+func (c multiChannel) Invoke(ctx context.Context, methodName string, req, resp any, opts ...grpc.CallOption) error {
 	ch := c.pick()
 	if ch == nil {
 		return status.Errorf(codes.Unavailable, "no channels ready")

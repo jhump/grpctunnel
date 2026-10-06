@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"reflect"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -127,7 +128,7 @@ func (h *threadSafeOpenTunnelClient) Send(msg *tunnelpb.ClientToServer) error {
 	return h.TunnelService_OpenTunnelClient.Send(msg)
 }
 
-func (h *threadSafeOpenTunnelClient) SendMsg(msg interface{}) error {
+func (h *threadSafeOpenTunnelClient) SendMsg(msg any) error {
 	h.sendMu.Lock()
 	defer h.sendMu.Unlock()
 	return h.TunnelService_OpenTunnelClient.SendMsg(msg)
@@ -139,7 +140,7 @@ func (h *threadSafeOpenTunnelClient) Recv() (*tunnelpb.ServerToClient, error) {
 	return h.TunnelService_OpenTunnelClient.Recv()
 }
 
-func (h *threadSafeOpenTunnelClient) RecvMsg(msg interface{}) error {
+func (h *threadSafeOpenTunnelClient) RecvMsg(msg any) error {
 	h.recvMu.Lock()
 	defer h.recvMu.Unlock()
 	return h.TunnelService_OpenTunnelClient.RecvMsg(msg)
@@ -157,7 +158,7 @@ func (h *threadSafeOpenReverseTunnelServer) Send(msg *tunnelpb.ClientToServer) e
 	return h.TunnelService_OpenReverseTunnelServer.Send(msg)
 }
 
-func (h *threadSafeOpenReverseTunnelServer) SendMsg(msg interface{}) error {
+func (h *threadSafeOpenReverseTunnelServer) SendMsg(msg any) error {
 	h.sendMu.Lock()
 	defer h.sendMu.Unlock()
 	return h.TunnelService_OpenReverseTunnelServer.SendMsg(msg)
@@ -169,7 +170,7 @@ func (h *threadSafeOpenReverseTunnelServer) Recv() (*tunnelpb.ServerToClient, er
 	return h.TunnelService_OpenReverseTunnelServer.Recv()
 }
 
-func (h *threadSafeOpenReverseTunnelServer) RecvMsg(msg interface{}) error {
+func (h *threadSafeOpenReverseTunnelServer) RecvMsg(msg any) error {
 	h.recvMu.Lock()
 	defer h.recvMu.Unlock()
 	return h.TunnelService_OpenReverseTunnelServer.RecvMsg(msg)
@@ -247,7 +248,7 @@ func (c *tunnelChannel) Close() {
 	c.close(nil)
 }
 
-func (c *tunnelChannel) Invoke(ctx context.Context, methodName string, req, resp interface{}, opts ...grpc.CallOption) error {
+func (c *tunnelChannel) Invoke(ctx context.Context, methodName string, req, resp any, opts ...grpc.CallOption) error {
 	str, err := c.newStream(ctx, false, false, methodName, opts...)
 	if err != nil {
 		return err
@@ -481,7 +482,7 @@ func (c *tunnelChannel) recvLoop() {
 		var supported bool
 		for _, rev := range settings.Settings.SupportedProtocolRevisions {
 			switch {
-			case inSlice(rev, supportedRevisions):
+			case slices.Contains(supportedRevisions, rev):
 				if rev > c.useRevision {
 					// use highest version that both server and client supports
 					c.useRevision = rev
@@ -512,15 +513,6 @@ func (c *tunnelChannel) recvLoop() {
 		}
 		str.acceptServerFrame(in.Frame)
 	}
-}
-
-func inSlice[S ~[]T, T comparable](find T, slice S) bool {
-	for _, elem := range slice {
-		if elem == find {
-			return true
-		}
-	}
-	return false
 }
 
 func (c *tunnelChannel) getStream(streamID int64) (*tunnelClientStream, error) {
@@ -677,7 +669,7 @@ func (st *tunnelClientStream) Context() context.Context {
 	return st.ctx
 }
 
-func (st *tunnelClientStream) SendMsg(m interface{}) error {
+func (st *tunnelClientStream) SendMsg(m any) error {
 	st.writeMu.Lock()
 	defer st.writeMu.Unlock()
 
@@ -698,7 +690,7 @@ func (st *tunnelClientStream) SendMsg(m interface{}) error {
 	return st.sender.send(b)
 }
 
-func (st *tunnelClientStream) RecvMsg(m interface{}) error {
+func (st *tunnelClientStream) RecvMsg(m any) error {
 	data, ok, err := st.readMsg()
 	if err != nil {
 		if !ok {

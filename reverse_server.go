@@ -62,7 +62,7 @@ func NewReverseTunnelServer(stub tunnelpb.TunnelServiceClient, opts ...TunnelOpt
 //
 // All services registered will be available for the other end of the tunnel to
 // invoke.
-func (s *ReverseTunnelServer) RegisterService(desc *grpc.ServiceDesc, srv interface{}) {
+func (s *ReverseTunnelServer) RegisterService(desc *grpc.ServiceDesc, srv any) {
 	s.handlers.RegisterService(desc, srv)
 }
 
@@ -202,7 +202,7 @@ func (h *threadSafeOpenReverseTunnelClient) Send(msg *tunnelpb.ServerToClient) e
 	return h.SendMsg(msg)
 }
 
-func (h *threadSafeOpenReverseTunnelClient) SendMsg(m interface{}) error {
+func (h *threadSafeOpenReverseTunnelClient) SendMsg(m any) error {
 	h.sendMu.Lock()
 	defer h.sendMu.Unlock()
 	if h.closed {
@@ -217,7 +217,7 @@ func (h *threadSafeOpenReverseTunnelClient) Recv() (*tunnelpb.ClientToServer, er
 	return h.TunnelService_OpenReverseTunnelClient.Recv()
 }
 
-func (h *threadSafeOpenReverseTunnelClient) RecvMsg(m interface{}) error {
+func (h *threadSafeOpenReverseTunnelClient) RecvMsg(m any) error {
 	h.recvMu.Lock()
 	defer h.recvMu.Unlock()
 	return h.TunnelService_OpenReverseTunnelClient.RecvMsg(m)
@@ -235,7 +235,7 @@ func (h *threadSafeOpenTunnelServer) Send(msg *tunnelpb.ServerToClient) error {
 	return h.TunnelService_OpenTunnelServer.Send(msg)
 }
 
-func (h *threadSafeOpenTunnelServer) SendMsg(m interface{}) error {
+func (h *threadSafeOpenTunnelServer) SendMsg(m any) error {
 	h.sendMu.Lock()
 	defer h.sendMu.Unlock()
 	return h.TunnelService_OpenTunnelServer.SendMsg(m)
@@ -247,7 +247,7 @@ func (h *threadSafeOpenTunnelServer) Recv() (*tunnelpb.ClientToServer, error) {
 	return h.TunnelService_OpenTunnelServer.Recv()
 }
 
-func (h *threadSafeOpenTunnelServer) RecvMsg(m interface{}) error {
+func (h *threadSafeOpenTunnelServer) RecvMsg(m any) error {
 	h.recvMu.Lock()
 	defer h.recvMu.Unlock()
 	return h.TunnelService_OpenTunnelServer.RecvMsg(m)

@@ -172,7 +172,7 @@ func runDeadlockTests(ctx context.Context, t *testing.T, ch grpc.ClientConnInter
 
 		stream, err := stub.BidiStream(slowCtx)
 		require.NoError(t, err)
-		for i := 0; i < 2; i++ {
+		for range 2 {
 			err := stream.Send(&grpchantesting.Message{
 				DelayMillis: 1000,
 				Payload:     bytes.Repeat([]byte{0, 1, 2, 3}, 10_000),
@@ -186,14 +186,14 @@ func runDeadlockTests(ctx context.Context, t *testing.T, ch grpc.ClientConnInter
 	time.Sleep(100 * time.Millisecond) // make sure the slow one has had time to issue its RPC
 
 	grp, ctx := errgroup.WithContext(ctx)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		grp.Go(func() error {
 			// this should proceed just fine, regardless of the slow one
 			stream, err := stub.ClientStream(ctx)
 			if err != nil {
 				return err
 			}
-			for j := 0; j < 20; j++ {
+			for range 20 {
 				err := stream.Send(&grpchantesting.Message{
 					Payload: bytes.Repeat([]byte{0, 1, 2, 3}, 5_000),
 				})
@@ -279,7 +279,7 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 				cli := grpchantesting.NewTestServiceClient(testCase.ch)
 				t.Run(testCase.name, func(t *testing.T) {
 					done := make(chan struct{})
-					var count int32
+					var count atomic.Int32
 					runOneThread := func() {
 						for {
 							select {
@@ -289,7 +289,7 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 							}
 							_, err := cli.Unary(context.Background(), &grpchantesting.Message{})
 							require.NoError(t, err)
-							atomic.AddInt32(&count, 1)
+							count.Add(1)
 						}
 					}
 
@@ -297,12 +297,8 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 					// other concurrency-related bugs.
 					checkForGoroutineLeak(t, func() {
 						var wg sync.WaitGroup
-						for i := 0; i < 10; i++ {
-							wg.Add(1)
-							go func() {
-								defer wg.Done()
-								runOneThread()
-							}()
+						for range 10 {
+							wg.Go(runOneThread)
 						}
 						// all threads sending concurrent requests for 3 seconds
 						time.Sleep(2 * time.Second)
@@ -310,7 +306,7 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 						wg.Wait()
 					})
 
-					t.Logf("RPCs sent: %d", atomic.LoadInt32(&count))
+					t.Logf("RPCs sent: %d", count.Load())
 				})
 			}
 		})
