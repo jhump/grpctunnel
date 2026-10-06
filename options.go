@@ -17,7 +17,7 @@ func WithInitialWindowSize(size uint32) TunnelOption {
 	})
 }
 
-// WithMaxChunkSize configured the maximum size of a single chunk of data to send.
+// WithMaxChunkSize configures the maximum size of a single chunk of data to send.
 // This will be clamped to the peer's initial flow control window size if set to a
 // larger value. If this option is not used or if this option is used to set the
 // value to zero, a default max chunk size of 16k will be used. Increasing this can

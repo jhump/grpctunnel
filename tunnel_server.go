@@ -202,8 +202,12 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 			},
 		})
 	}
-	streamName := fmt.Sprintf("svr@%p:<%d>", s, streamID)
-	str.sender = newSender(ctx, frame.InitialWindowSize, s.tunnelOpts.maxChunkSize, sendFunc, streamName+"resp")
+	var reqStreamName, respStreamName string
+	if debugEnabled {
+		streamName := fmt.Sprintf("svr@%p<%d>", s, streamID)
+		reqStreamName, respStreamName = streamName+":req", streamName+":resp"
+	}
+	str.sender = newSender(ctx, frame.InitialWindowSize, s.tunnelOpts.maxChunkSize, sendFunc, respStreamName)
 	str.receiver = newReceiver(
 		func(m tunnelpb.ClientToServerFrame) uint {
 			switch m := m.(type) {
@@ -229,7 +233,7 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 		},
 		s.tunnelOpts.initialWindowSize,
 		s.tunnelOpts.minWindowUpdateSize,
-		streamName+"req",
+		reqStreamName,
 	)
 
 	s.streams[streamID] = str

@@ -4,6 +4,10 @@ package grpctunnel
 
 import "log"
 
+// debugEnabled is true when built with the "debug" build tag. It can be used
+// to skip work, like formatting stream names, that is only needed for logging.
+const debugEnabled = true
+
 func logSend(stream string, chunkIndex int, chunkSize, totalMsgSize, windowRemaining uint32) {
 	log.Printf("%s: sending chunk #%d, %d bytes (out of %d) -- window size: %d => %d",
 		stream, chunkIndex+1, chunkSize, totalMsgSize, windowRemaining, int(windowRemaining)-int(chunkSize))

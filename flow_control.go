@@ -98,13 +98,7 @@ func (s *sender) send(data []byte) error {
 			continue
 		}
 
-		chunkSz := windowSz
-		if chunkSz > uint32(len(data)) {
-			chunkSz = uint32(len(data))
-		}
-		if chunkSz > s.maxChunkSize {
-			chunkSz = s.maxChunkSize
-		}
+		chunkSz := min(windowSz, uint32(len(data)), s.maxChunkSize)
 		if !s.currentWindow.CompareAndSwap(windowSz, windowSz-chunkSz) {
 			continue
 		}
@@ -170,9 +164,6 @@ func newReceiver[T any](
 
 func (r *receiver[T]) accept(item T) error {
 	sz := r.measure(item)
-	if sz == 0 {
-		return nil
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {

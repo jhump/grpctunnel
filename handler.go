@@ -5,11 +5,10 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"google.golang.org/grpc/metadata"
-
 	"github.com/fullstorydev/grpchan"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/jhump/grpctunnel/tunnelpb"
@@ -115,8 +114,9 @@ func NewTunnelServiceHandler(options TunnelServiceHandlerOptions) *TunnelService
 		reverse:                   newReverseChannels(),
 		reverseByKey:              map[any]*reverseChannels{},
 		tunnelOpts: tunnelOpts{
-			initialWindowSize: options.InitialWindowSize,
-			maxChunkSize:      options.MaxChunkSize,
+			initialWindowSize:   options.InitialWindowSize,
+			maxChunkSize:        options.MaxChunkSize,
+			minWindowUpdateSize: options.MinWindowUpdateSize,
 		},
 	}
 	initOptions(&handler.tunnelOpts, nil)

@@ -8,9 +8,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/fullstorydev/grpchan/grpchantesting"
+	"github.com/fullstorydev/grpchan/inprocgrpc"
 	"github.com/jhump/grpctunnel/internal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,7 +29,7 @@ func TestTunnelServiceHandler(t *testing.T) {
 	var svr grpchantesting.TestServer
 	cli, ts := setupServer(t, &svr)
 	runTests(
-		t.Context(), t, modeRunNested, cli, ts, &svr,
+		t.Context(), t, modeRunNested, false, cli, ts, &svr,
 		func(_ context.Context, t *testing.T, ch grpc.ClientConnInterface) {
 			grpchantesting.RunChannelTestCases(t, ch, true)
 		},
@@ -63,19 +65,29 @@ func TestTunnelServiceHandler_Deadlocks(t *testing.T) {
 			opts: []TunnelOption{WithInitialWindowSize(16 * 1024), WithMaxChunkSize(4 * 1024), WithMinWindowUpdateSize(4 * 1024)},
 		},
 	}
-	for _, tc := range testCases {
-		var svr grpchantesting.TestServer
-		cli, ts := setupServer(t, &svr, tc.opts...)
-		t.Run("server="+tc.name, func(t *testing.T) {
-			for _, tc := range testCases {
-				t.Run("client="+tc.name, func(t *testing.T) {
-					runTests(
-						t.Context(), t, modeRunNested, cli, ts, &svr,
-						func(ctx context.Context, t *testing.T, ch grpc.ClientConnInterface) {
-							runDeadlockTests(ctx, t, ch)
-						},
-						tc.opts...,
-					)
+	for _, serverCase := range testCases {
+		t.Run("server="+serverCase.name, func(t *testing.T) {
+			for _, clientCase := range testCases {
+				t.Run("client="+clientCase.name, func(t *testing.T) {
+					t.Parallel()
+					// Each combination runs in its own bubble, with its own server, so
+					// the timeouts and delays in these tests use fake time and so that
+					// concurrent combinations can't interfere with each other.
+					synctest.Test(t, func(t *testing.T) {
+						var svr grpchantesting.TestServer
+						cli, ts := setupInProcessServer(&svr, serverCase.opts...)
+						runTests(
+							t.Context(), t, modeRunNested, true, cli, ts, &svr,
+							func(ctx context.Context, t *testing.T, ch grpc.ClientConnInterface) {
+								runDeadlockTests(ctx, t, ch)
+							},
+							clientCase.opts...,
+						)
+						// The test server's handlers ignore cancellation, so some may
+						// still be sleeping. Let them finish so synctest.Test doesn't
+						// report them as leaked.
+						time.Sleep(5 * time.Second)
+					})
 				})
 			}
 		})
@@ -94,6 +106,7 @@ func runTests(
 	ctx context.Context,
 	t *testing.T,
 	mode nestingMode,
+	inBubble bool,
 	cl tunnelpb.TunnelServiceClient,
 	ts *TunnelServiceHandler,
 	testSvr *grpchantesting.TestServer,
@@ -106,79 +119,99 @@ func runTests(
 		ctx = metadata.AppendToOutgoingContext(ctx, "nesting-level", "1")
 	}
 
-	t.Run(prefix+"forward", func(t *testing.T) {
-		checkForGoroutineLeak(t, func() {
-			ch, err := NewChannel(cl, opts...).Start(ctx)
-			require.NoError(t, err, "failed to open tunnel")
-
-			defer func() {
-				ch.Close()
-				<-ch.Done()
-				assert.NoError(t, ch.Err(), "channel ended with error")
-			}()
-
-			testFunc(ctx, t, ch)
-
-			if mode == modeRunNested {
-				// nested/recursive test
-				runTests(
-					ch.Context(), t, modeIsNested,
-					tunnelpb.NewTunnelServiceClient(ch),
-					ts, testSvr, testFunc,
-					opts...,
-				)
-			}
+	runSubtest := func(name string, fn func(t *testing.T)) {
+		if inBubble {
+			// T.Run may not be called inside a synctest bubble, so run inline.
+			// Goroutine leaks are instead detected by synctest.Test, which fails
+			// if any goroutines in the bubble are still blocked when it exits.
+			// TODO: That only catches leaks at the end of the whole bubble, not
+			// per subtest. We could restore per-subtest checks by running fn
+			// via pprof.Do with a unique label (goroutines inherit labels from
+			// their creator) and polling the goroutine profile until no
+			// goroutines with that label remain.
+			// TODO: If a leaked goroutine is blocked on a mutex (or anything
+			// else synctest doesn't consider "durably blocked"), synctest.Test
+			// hangs instead of failing, until "go test -timeout" fires. A
+			// real-time watchdog started outside the bubble could fail fast
+			// with a goroutine dump instead.
+			t.Logf("running %s", name)
+			fn(t)
+			return
+		}
+		t.Run(name, func(t *testing.T) {
+			checkForGoroutineLeak(t, func() { fn(t) })
 		})
+	}
+
+	runSubtest(prefix+"forward", func(t *testing.T) {
+		ch, err := NewChannel(cl, opts...).Start(ctx)
+		require.NoError(t, err, "failed to open tunnel")
+
+		defer func() {
+			ch.Close()
+			<-ch.Done()
+			assert.NoError(t, ch.Err(), "channel ended with error")
+		}()
+
+		testFunc(ctx, t, ch)
+
+		if mode == modeRunNested {
+			// nested/recursive test
+			runTests(
+				ch.Context(), t, modeIsNested, inBubble,
+				tunnelpb.NewTunnelServiceClient(ch),
+				ts, testSvr, testFunc,
+				opts...,
+			)
+		}
 	})
 
-	t.Run(prefix+"reverse", func(t *testing.T) {
-		checkForGoroutineLeak(t, func() {
-			revSvr := NewReverseTunnelServer(cl)
-			if mode == modeRunNested {
-				// we need this to run the nested/recursive tunnel test
-				tunnelpb.RegisterTunnelServiceServer(revSvr, ts.Service())
-			}
-			grpchantesting.RegisterTestServiceServer(revSvr, testSvr)
-			serveDone := make(chan struct{})
-			go func() {
-				defer close(serveDone)
-				started, err := revSvr.Serve(ctx)
-				assert.True(t, started, "ReverseTunnelServer.Serve returned false")
-				assert.NoError(t, err, "ReverseTunnelServer.Serve returned error")
-			}()
-			defer func() {
-				revSvr.Stop()
-				<-serveDone
-			}()
+	runSubtest(prefix+"reverse", func(t *testing.T) {
+		revSvr := NewReverseTunnelServer(cl)
+		if mode == modeRunNested {
+			// we need this to run the nested/recursive tunnel test
+			tunnelpb.RegisterTunnelServiceServer(revSvr, ts.Service())
+		}
+		grpchantesting.RegisterTestServiceServer(revSvr, testSvr)
+		serveDone := make(chan struct{})
+		go func() {
+			defer close(serveDone)
+			started, err := revSvr.Serve(ctx)
+			assert.True(t, started, "ReverseTunnelServer.Serve returned false")
+			assert.NoError(t, err, "ReverseTunnelServer.Serve returned error")
+		}()
+		defer func() {
+			revSvr.Stop()
+			<-serveDone
+		}()
 
-			// make sure server has registered client, so we can issue RPCs to it
-			var ch ReverseClientConnInterface
-			if mode == modeIsNested {
-				ch = ts.KeyAsChannel("1")
-			} else {
-				ch = ts.AsChannel()
-			}
-			timedCtx, cancel := context.WithTimeout(ctx, time.Second)
-			defer cancel()
-			err := ch.WaitForReady(timedCtx)
-			require.NoError(t, err, "reverse channel never became ready")
+		// make sure server has registered client, so we can issue RPCs to it
+		var ch ReverseClientConnInterface
+		if mode == modeIsNested {
+			ch = ts.KeyAsChannel("1")
+		} else {
+			ch = ts.AsChannel()
+		}
+		timedCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		err := ch.WaitForReady(timedCtx)
+		require.NoError(t, err, "reverse channel never became ready")
 
-			testFunc(ctx, t, ch)
+		testFunc(ctx, t, ch)
 
-			if mode == modeRunNested {
-				// nested/recursive test
-				runTests(
-					ctx, t, modeIsNested,
-					tunnelpb.NewTunnelServiceClient(ch),
-					ts, testSvr, testFunc,
-					opts...,
-				)
-			}
+		if mode == modeRunNested {
+			// nested/recursive test
+			runTests(
+				ctx, t, modeIsNested, inBubble,
+				tunnelpb.NewTunnelServiceClient(ch),
+				ts, testSvr, testFunc,
+				opts...,
+			)
+		}
 
-			for i, rt := range ts.AllReverseTunnels() {
-				assert.NoError(t, rt.Err(), "reverse tunnel channel %d ended with error", i)
-			}
-		})
+		for i, rt := range ts.AllReverseTunnels() {
+			assert.NoError(t, rt.Err(), "reverse tunnel channel %d ended with error", i)
+		}
 	})
 }
 
@@ -198,7 +231,7 @@ func runDeadlockTests(ctx context.Context, t *testing.T, ch grpc.ClientConnInter
 
 		stream, err := stub.BidiStream(slowCtx)
 		require.NoError(t, err)
-		for i := 0; i < 2; i++ {
+		for range 2 {
 			err := stream.Send(&grpchantesting.Message{
 				DelayMillis: 1000,
 				Payload:     bytes.Repeat([]byte{0, 1, 2, 3}, 10_000),
@@ -212,14 +245,14 @@ func runDeadlockTests(ctx context.Context, t *testing.T, ch grpc.ClientConnInter
 	time.Sleep(100 * time.Millisecond) // make sure the slow one has had time to issue its RPC
 
 	grp, ctx := errgroup.WithContext(ctx)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		grp.Go(func() error {
 			// this should proceed just fine, regardless of the slow one
 			stream, err := stub.ClientStream(ctx)
 			if err != nil {
 				return err
 			}
-			for j := 0; j < 20; j++ {
+			for range 20 {
 				err := stream.Send(&grpchantesting.Message{
 					Payload: bytes.Repeat([]byte{0, 1, 2, 3}, 5_000),
 				})
@@ -290,7 +323,7 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 		cli := grpchantesting.NewTestServiceClient(testCase.ch)
 		t.Run(testCase.name, func(t *testing.T) {
 			done := make(chan struct{})
-			var count int32
+			var count atomic.Int32
 			runOneThread := func() {
 				for {
 					select {
@@ -302,7 +335,7 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 					if !assert.NoError(t, err) {
 						return
 					}
-					atomic.AddInt32(&count, 1)
+					count.Add(1)
 				}
 			}
 
@@ -310,12 +343,8 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 			// other concurrency-related bugs.
 			checkForGoroutineLeak(t, func() {
 				var wg sync.WaitGroup
-				for i := 0; i < 10; i++ {
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
-						runOneThread()
-					}()
+				for range 10 {
+					wg.Go(runOneThread)
 				}
 				// all threads sending concurrent requests for 3 seconds
 				time.Sleep(2 * time.Second)
@@ -323,7 +352,7 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 				wg.Wait()
 			})
 
-			t.Logf("RPCs sent: %d", atomic.LoadInt32(&count))
+			t.Logf("RPCs sent: %d", count.Load())
 		})
 	}
 }
@@ -331,7 +360,7 @@ func TestTunnelServiceHandler_Concurrency(t *testing.T) {
 // TODO: also need more tests around channel lifecycle, and ensuring it
 // properly respects things like context cancellations, etc
 
-func setupServer(t *testing.T, svc grpchantesting.TestServiceServer, opts ...TunnelOption) (tunnelpb.TunnelServiceClient, *TunnelServiceHandler) {
+func newTestHandler(svc grpchantesting.TestServiceServer, opts ...TunnelOption) *TunnelServiceHandler {
 	var options tunnelOpts
 	for _, opt := range opts {
 		opt.apply(&options)
@@ -345,13 +374,29 @@ func setupServer(t *testing.T, svc grpchantesting.TestServiceServer, opts ...Tun
 			}
 			return vals[0]
 		},
-		InitialWindowSize: options.initialWindowSize,
-		MaxChunkSize:      options.maxChunkSize,
+		InitialWindowSize:   options.initialWindowSize,
+		MaxChunkSize:        options.maxChunkSize,
+		MinWindowUpdateSize: options.minWindowUpdateSize,
 	})
 	grpchantesting.RegisterTestServiceServer(ts, svc)
 	// recursive: tunnels can be run on top of tunnels
 	// (not realistic, but fun exercise to verify soundness of implementation)
 	tunnelpb.RegisterTunnelServiceServer(ts, ts.Service())
+	return ts
+}
+
+// setupInProcessServer is like setupServer, except that the tunnel service is
+// exposed via an in-process channel instead of over the network. Unlike
+// setupServer, this can be used inside a synctest bubble.
+func setupInProcessServer(svc grpchantesting.TestServiceServer, opts ...TunnelOption) (tunnelpb.TunnelServiceClient, *TunnelServiceHandler) {
+	ts := newTestHandler(svc, opts...)
+	var ch inprocgrpc.Channel
+	tunnelpb.RegisterTunnelServiceServer(&ch, ts.Service())
+	return tunnelpb.NewTunnelServiceClient(&ch), ts
+}
+
+func setupServer(t *testing.T, svc grpchantesting.TestServiceServer, opts ...TunnelOption) (tunnelpb.TunnelServiceClient, *TunnelServiceHandler) {
+	ts := newTestHandler(svc, opts...)
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err, "failed to listen")
