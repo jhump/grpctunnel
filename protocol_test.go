@@ -1,6 +1,7 @@
 package grpctunnel
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -14,6 +15,195 @@ import (
 
 	"github.com/jhump/grpctunnel/tunnelpb"
 )
+
+// TODO: The tests in this file verify the protocol as implemented by this
+// version of the package. They don't verify interoperability with older
+// versions. That is currently done manually, using the tunneltestsvr and
+// tunneltestclient programs (in internal/cmd), built from both the current
+// code and from older releases, and running every combination of client and
+// server. We could automate that by building the older programs in a test,
+// e.g. "go install github.com/jhump/grpctunnel/internal/cmd/tunneltestsvr@v0.3.0".
+
+func TestTunnelServer_AcceptsSupportedRevisions(t *testing.T) {
+	for _, revision := range supportedRevisions {
+		t.Run(revision.String(), func(t *testing.T) {
+			var svr grpchantesting.TestServer
+			tunnelCli, _ := setupInProcessServer(&svr)
+			ctx := metadata.AppendToOutgoingContext(t.Context(), grpctunnelNegotiateKey, grpctunnelNegotiateVal)
+			stream, err := tunnelCli.OpenTunnel(ctx)
+			require.NoError(t, err)
+
+			// We use the smallest allowed window size for receiving the response,
+			// and empty request and response messages.
+			sendFrames(t, stream,
+				&tunnelpb.ClientToServer{
+					StreamId: 1,
+					Frame: &tunnelpb.ClientToServer_NewStream{
+						NewStream: &tunnelpb.NewStream{
+							MethodName:        "grpchantesting.TestService/UseExternalMessageTwice",
+							ProtocolRevision:  revision,
+							InitialWindowSize: minWindowSize(revision),
+						},
+					},
+				},
+				&tunnelpb.ClientToServer{
+					StreamId: 1,
+					Frame:    &tunnelpb.ClientToServer_RequestMessage{RequestMessage: &tunnelpb.MessageData{}},
+				},
+				&tunnelpb.ClientToServer{
+					StreamId: 1,
+					Frame:    &tunnelpb.ClientToServer_HalfClose{HalfClose: &emptypb.Empty{}},
+				},
+			)
+			var gotResponse bool
+			for {
+				in, err := stream.Recv()
+				require.NoError(t, err)
+				if in.StreamId != 1 {
+					continue
+				}
+				switch frame := in.Frame.(type) {
+				case *tunnelpb.ServerToClient_ResponseMessage:
+					require.Zero(t, frame.ResponseMessage.Size)
+					gotResponse = true
+				case *tunnelpb.ServerToClient_CloseStream:
+					require.NoError(t, status.FromProto(frame.CloseStream.Status).Err())
+					require.True(t, gotResponse, "stream closed without sending response")
+					return
+				}
+			}
+		})
+	}
+}
+
+func TestTunnelServer_RejectsRevisionZeroClientPerStream(t *testing.T) {
+	// A client that only supports revision zero (v0.2 or earlier) doesn't
+	// send the negotiation header. Such clients don't report the cause when
+	// a tunnel fails, so the server instead keeps the tunnel open and rejects
+	// each stream, which they do report.
+	var svr grpchantesting.TestServer
+	tunnelCli, _ := setupInProcessServer(&svr)
+	stream, err := tunnelCli.OpenTunnel(t.Context())
+	require.NoError(t, err)
+
+	for streamID := int64(1); streamID <= 2; streamID++ {
+		// Revision zero clients don't set the protocol revision or window size.
+		sendFrames(t, stream,
+			&tunnelpb.ClientToServer{
+				StreamId: streamID,
+				Frame: &tunnelpb.ClientToServer_NewStream{
+					NewStream: &tunnelpb.NewStream{MethodName: "grpchantesting.TestService/Unary"},
+				},
+			},
+			&tunnelpb.ClientToServer{
+				StreamId: streamID,
+				Frame:    &tunnelpb.ClientToServer_RequestMessage{RequestMessage: &tunnelpb.MessageData{}},
+			},
+			&tunnelpb.ClientToServer{
+				StreamId: streamID,
+				Frame:    &tunnelpb.ClientToServer_HalfClose{HalfClose: &emptypb.Empty{}},
+			},
+		)
+		in, err := stream.Recv()
+		require.NoError(t, err)
+		require.Equal(t, streamID, in.StreamId, "server should not send settings to revision zero client")
+		closeStream, ok := in.Frame.(*tunnelpb.ServerToClient_CloseStream)
+		require.True(t, ok, "expected CloseStream frame, got %T", in.Frame)
+		st := status.FromProto(closeStream.CloseStream.Status)
+		require.Equal(t, codes.Unavailable, st.Code())
+		require.Contains(t, st.Message(), "server does not support protocol revision 0 anymore; upgrade client to v0.3 or later")
+	}
+}
+
+func TestReverseTunnelServer_RejectsRevisionZeroPeerPerStream(t *testing.T) {
+	// In a reverse tunnel, the network server is the tunnel client. So when it
+	// only supports revision zero, the error should say to upgrade it.
+	var inproc inprocgrpc.Channel
+	fakeSvr := &revisionZeroReverseTunnelServer{result: make(chan *status.Status, 1)}
+	tunnelpb.RegisterTunnelServiceServer(&inproc, fakeSvr)
+	revSvr := NewReverseTunnelServer(tunnelpb.NewTunnelServiceClient(&inproc))
+	grpchantesting.RegisterTestServiceServer(revSvr, &grpchantesting.TestServer{})
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		_, _ = revSvr.Serve(t.Context())
+	}()
+	defer func() {
+		revSvr.Stop()
+		<-serveDone
+	}()
+
+	select {
+	case st := <-fakeSvr.result:
+		require.Equal(t, codes.Unavailable, st.Code())
+		require.Contains(t, st.Message(), "tunnel server (network client) does not support protocol revision 0 anymore; "+
+			"upgrade tunnel client (network server) to v0.3 or later")
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream was never closed")
+	}
+}
+
+// revisionZeroReverseTunnelServer acts like a network server from v0.2 or
+// earlier, which only supports revision zero. When a reverse tunnel is opened,
+// it creates a stream and reports the status with which the stream is closed.
+type revisionZeroReverseTunnelServer struct {
+	tunnelpb.UnimplementedTunnelServiceServer
+	result chan *status.Status
+}
+
+func (s *revisionZeroReverseTunnelServer) OpenReverseTunnel(stream tunnelpb.TunnelService_OpenReverseTunnelServer) error {
+	// Like v0.2, send headers right away, but without the negotiation header.
+	// (v0.2 sends empty headers, but the in-process channel won't actually
+	// send headers if there are none, so we send a placeholder.)
+	if err := stream.SendHeader(metadata.Pairs("fake-version", "v0.2")); err != nil {
+		return err
+	}
+	// Revision zero peers don't set the protocol revision or window size.
+	frames := []*tunnelpb.ClientToServer{
+		{
+			StreamId: 1,
+			Frame: &tunnelpb.ClientToServer_NewStream{
+				NewStream: &tunnelpb.NewStream{MethodName: "grpchantesting.TestService/Unary"},
+			},
+		},
+		{
+			StreamId: 1,
+			Frame:    &tunnelpb.ClientToServer_RequestMessage{RequestMessage: &tunnelpb.MessageData{}},
+		},
+		{
+			StreamId: 1,
+			Frame:    &tunnelpb.ClientToServer_HalfClose{HalfClose: &emptypb.Empty{}},
+		},
+	}
+	for _, frame := range frames {
+		if err := stream.Send(frame); err != nil {
+			return err
+		}
+	}
+	for {
+		in, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		if closeStream, ok := in.Frame.(*tunnelpb.ServerToClient_CloseStream); ok && in.StreamId == 1 {
+			s.result <- status.FromProto(closeStream.CloseStream.Status)
+			return nil
+		}
+	}
+}
+
+func TestTunnelServiceHandler_RejectsRevisionZeroReverseTunnel(t *testing.T) {
+	// In a reverse tunnel, the network client is the tunnel server. So when it
+	// only supports revision zero, the error should say to upgrade it.
+	var svr grpchantesting.TestServer
+	tunnelCli, _ := setupInProcessServer(&svr)
+	// Like v0.2 and earlier, we don't send the negotiation header.
+	stream, err := tunnelCli.OpenReverseTunnel(t.Context())
+	require.NoError(t, err)
+	_, err = stream.Recv()
+	require.ErrorContains(t, err, "tunnel client (network server) does not support protocol revision 0 anymore; "+
+		"upgrade tunnel server (network client) to v0.3 or later")
+}
 
 func TestTunnelServer_RejectsBadNewStream(t *testing.T) {
 	validNewStream := func() *tunnelpb.NewStream {
@@ -39,10 +229,20 @@ func TestTunnelServer_RejectsBadNewStream(t *testing.T) {
 			expectMsg:  "initial window size",
 		},
 		{
+			name: "window-too-small-for-revision-two",
+			modify: func(ns *tunnelpb.NewStream) {
+				ns.ProtocolRevision = tunnelpb.ProtocolRevision_REVISION_TWO
+				ns.InitialWindowSize = 5
+			},
+			expectCode: codes.Internal,
+			expectMsg:  "initial window size",
+		},
+		{
+			// like a v0.3 client with flow control disabled
 			name:       "revision-zero",
 			modify:     func(ns *tunnelpb.NewStream) { ns.ProtocolRevision = tunnelpb.ProtocolRevision_REVISION_ZERO },
 			expectCode: codes.Unavailable,
-			expectMsg:  "upgrade client",
+			expectMsg:  "server does not support protocol revision 0 anymore; client must not disable flow control",
 		},
 		{
 			name:       "unknown-revision",
@@ -120,46 +320,167 @@ func TestTunnelServer_RejectsBadNewStream(t *testing.T) {
 	}
 }
 
-func TestTunnelChannel_RejectsZeroInitialWindowSize(t *testing.T) {
-	var inproc inprocgrpc.Channel
-	tunnelpb.RegisterTunnelServiceServer(&inproc, zeroWindowTunnelServer{})
-	ch, err := NewChannel(tunnelpb.NewTunnelServiceClient(&inproc)).Start(t.Context())
-	require.NoError(t, err)
-	defer ch.Close()
-
-	select {
-	case <-ch.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("tunnel was not closed after receiving bad settings")
-	}
-	require.ErrorContains(t, ch.Err(), "initial window size")
-}
-
-// zeroWindowTunnelServer is a tunnel server that advertises an initial
-// window size of zero, which is invalid.
-type zeroWindowTunnelServer struct {
-	tunnelpb.UnimplementedTunnelServiceServer
-}
-
-func (zeroWindowTunnelServer) OpenTunnel(stream tunnelpb.TunnelService_OpenTunnelServer) error {
-	if err := stream.SendHeader(metadata.Pairs(grpctunnelNegotiateKey, grpctunnelNegotiateVal)); err != nil {
-		return err
-	}
-	err := stream.Send(&tunnelpb.ServerToClient{
-		StreamId: -1,
-		Frame: &tunnelpb.ServerToClient_Settings{
-			Settings: &tunnelpb.Settings{
-				SupportedProtocolRevisions: []tunnelpb.ProtocolRevision{tunnelpb.ProtocolRevision_REVISION_ONE},
-			},
+func TestTunnelChannel_NegotiatesRevision(t *testing.T) {
+	revisions := func(revs ...tunnelpb.ProtocolRevision) []tunnelpb.ProtocolRevision { return revs }
+	const (
+		zero = tunnelpb.ProtocolRevision_REVISION_ZERO
+		one  = tunnelpb.ProtocolRevision_REVISION_ONE
+		two  = tunnelpb.ProtocolRevision_REVISION_TWO
+	)
+	testCases := []struct {
+		name string
+		// if true, the server acts like v0.2 and earlier, which don't negotiate
+		revisionZero bool
+		revisions    []tunnelpb.ProtocolRevision
+		windowSize   uint32
+		// either the revision the client should use or the error it should report
+		expectRevision tunnelpb.ProtocolRevision
+		expectErr      string
+	}{
+		{
+			// like a v0.3 server
+			name:           "zero-and-one",
+			revisions:      revisions(zero, one),
+			windowSize:     defaultInitialWindowSize,
+			expectRevision: one,
 		},
-	})
-	if err != nil {
-		return err
+		{
+			name:           "one-and-two",
+			revisions:      revisions(one, two),
+			windowSize:     defaultInitialWindowSize,
+			expectRevision: two,
+		},
+		{
+			name:           "includes-unknown-revision",
+			revisions:      revisions(one, two, 99),
+			windowSize:     defaultInitialWindowSize,
+			expectRevision: two,
+		},
+		{
+			// like a v0.2 server, which doesn't negotiate
+			name:         "no-negotiation",
+			revisionZero: true,
+			expectErr:    "client does not support protocol revision 0 anymore; upgrade server to v0.3 or later",
+		},
+		{
+			// like a v0.3 server with flow control disabled
+			name:       "only-zero",
+			revisions:  revisions(zero),
+			windowSize: defaultInitialWindowSize,
+			expectErr:  "client does not support protocol revision 0 anymore; server must not disable flow control",
+		},
+		{
+			name:       "zero-window",
+			revisions:  revisions(one),
+			windowSize: 0,
+			expectErr:  "initial window size",
+		},
+		{
+			name:           "small-window-ok-for-revision-one",
+			revisions:      revisions(one),
+			windowSize:     1,
+			expectRevision: one,
+		},
+		{
+			name:       "window-too-small-for-revision-two",
+			revisions:  revisions(one, two),
+			windowSize: 5,
+			expectErr:  "initial window size",
+		},
 	}
-	// Wait for the client to hang up.
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fakeSvr := &fakeTunnelServer{
+				revisionZero: testCase.revisionZero,
+				settings: &tunnelpb.Settings{
+					SupportedProtocolRevisions: testCase.revisions,
+					InitialWindowSize:          testCase.windowSize,
+				},
+				newStreams: make(chan *tunnelpb.NewStream, 1),
+			}
+			var inproc inprocgrpc.Channel
+			tunnelpb.RegisterTunnelServiceServer(&inproc, fakeSvr)
+			ch, err := NewChannel(tunnelpb.NewTunnelServiceClient(&inproc)).Start(t.Context())
+			require.NoError(t, err)
+			defer ch.Close()
+
+			if testCase.expectErr != "" {
+				select {
+				case <-ch.Done():
+				case <-time.After(5 * time.Second):
+					t.Fatal("tunnel was not closed after receiving bad settings")
+				}
+				require.ErrorContains(t, ch.Err(), testCase.expectErr)
+				// RPCs should also report the reason the tunnel was closed.
+				_, err := grpchantesting.NewTestServiceClient(ch).Unary(t.Context(), &grpchantesting.Message{})
+				require.ErrorContains(t, err, testCase.expectErr)
+				return
+			}
+
+			// Start an RPC, so we can see what revision the client uses. The fake
+			// server never replies, so we cancel the RPC when done.
+			ctx, cancel := context.WithCancel(t.Context())
+			rpcDone := make(chan struct{})
+			go func() {
+				defer close(rpcDone)
+				_, _ = grpchantesting.NewTestServiceClient(ch).Unary(ctx, &grpchantesting.Message{})
+			}()
+			defer func() {
+				cancel()
+				<-rpcDone
+			}()
+			select {
+			case newStream := <-fakeSvr.newStreams:
+				require.Equal(t, testCase.expectRevision, newStream.ProtocolRevision)
+			case <-time.After(5 * time.Second):
+				t.Fatalf("client never created stream; tunnel error: %v", ch.Err())
+			}
+		})
+	}
+}
+
+// fakeTunnelServer is a tunnel server that sends the given settings and then
+// reports any NewStream frames it receives, without ever replying to them.
+// If revisionZero is true, it instead acts like v0.2, which doesn't negotiate
+// or send settings.
+type fakeTunnelServer struct {
+	tunnelpb.UnimplementedTunnelServiceServer
+	revisionZero bool
+	settings     *tunnelpb.Settings
+	newStreams   chan *tunnelpb.NewStream
+}
+
+func (s *fakeTunnelServer) OpenTunnel(stream tunnelpb.TunnelService_OpenTunnelServer) error {
+	if s.revisionZero {
+		// Like v0.2, send headers right away, but without the negotiation header.
+		// (v0.2 sends empty headers, but the in-process channel won't actually
+		// send headers if there are none, so we send a placeholder.)
+		if err := stream.SendHeader(metadata.Pairs("fake-version", "v0.2")); err != nil {
+			return err
+		}
+	} else {
+		if err := stream.SendHeader(metadata.Pairs(grpctunnelNegotiateKey, grpctunnelNegotiateVal)); err != nil {
+			return err
+		}
+		err := stream.Send(&tunnelpb.ServerToClient{
+			StreamId: -1,
+			Frame:    &tunnelpb.ServerToClient_Settings{Settings: s.settings},
+		})
+		if err != nil {
+			return err
+		}
+	}
 	for {
-		if _, err := stream.Recv(); err != nil {
+		in, err := stream.Recv()
+		if err != nil {
+			// client hung up
 			return nil
+		}
+		if newStream, ok := in.Frame.(*tunnelpb.ClientToServer_NewStream); ok {
+			select {
+			case s.newStreams <- newStream.NewStream:
+			default:
+			}
 		}
 	}
 }

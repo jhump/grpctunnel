@@ -8,9 +8,9 @@ import "log"
 // to skip work, like formatting stream names, that is only needed for logging.
 const debugEnabled = true
 
-func logSend(stream string, chunkIndex int, chunkSize, totalMsgSize, windowRemaining uint32) {
-	log.Printf("%s: sending chunk #%d, %d bytes (out of %d) -- window size: %d => %d",
-		stream, chunkIndex+1, chunkSize, totalMsgSize, windowRemaining, int(windowRemaining)-int(chunkSize))
+func logSend(stream string, chunkIndex int, chunkSize, overhead, totalMsgSize, windowRemaining uint32) {
+	log.Printf("%s: sending chunk #%d, %d bytes (out of %d) + %d overhead -- window size: %d => %d",
+		stream, chunkIndex+1, chunkSize, totalMsgSize, overhead, windowRemaining, int(windowRemaining)-int(chunkSize)-int(overhead))
 }
 
 func logSenderUpdate(stream string, ackSize, windowRemaining uint32) {

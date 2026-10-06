@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,11 +23,12 @@ import (
 	"github.com/jhump/grpctunnel/tunnelpb"
 )
 
-func serveTunnel(stream tunnelStreamServer, tunnelMetadata metadata.MD, clientAcceptsSettings bool, opts *tunnelOpts, handlers grpchan.HandlerMap, isClosing func() bool) error {
+func serveTunnel(stream tunnelStreamServer, tunnelMetadata metadata.MD, clientAcceptsSettings, reverse bool, opts *tunnelOpts, handlers grpchan.HandlerMap, isClosing func() bool) error {
 	svr := &tunnelServer{
 		stream:                stream,
 		services:              handlers,
 		clientAcceptsSettings: clientAcceptsSettings,
+		reverse:               reverse,
 		tunnelOpts:            opts,
 		isClosing:             isClosing,
 		streams:               map[int64]*tunnelServerStream{},
@@ -45,6 +47,7 @@ type tunnelServer struct {
 	stream                tunnelStreamServer
 	services              grpchan.HandlerMap
 	clientAcceptsSettings bool
+	reverse               bool
 	tunnelOpts            *tunnelOpts
 	isClosing             func() bool
 
@@ -54,22 +57,26 @@ type tunnelServer struct {
 }
 
 func (s *tunnelServer) serve(tunnelMetadata metadata.MD) error {
-	if !s.clientAcceptsSettings {
-		return fmt.Errorf("protocol error: client only supports revision %v, but server only supports revision %v; upgrade client to v0.3 or later",
-			tunnelpb.ProtocolRevision_REVISION_ZERO, tunnelpb.ProtocolRevision_REVISION_ONE)
-	}
-
-	go func() {
-		_ = s.stream.Send(&tunnelpb.ServerToClient{
-			StreamId: -1,
-			Frame: &tunnelpb.ServerToClient_Settings{
-				Settings: &tunnelpb.Settings{
-					InitialWindowSize:          s.tunnelOpts.initialWindowSize,
-					SupportedProtocolRevisions: []tunnelpb.ProtocolRevision{tunnelpb.ProtocolRevision_REVISION_ONE},
+	// If the client doesn't accept settings, it only supports revision zero,
+	// which is no longer supported. But we don't fail the whole tunnel: older
+	// clients don't report the cause of the tunnel failing, so users would see
+	// a generic error (like "EOF"). Instead, each stream the client creates is
+	// rejected with an error that says to upgrade (see createStream). Since such
+	// streams are rejected immediately, no data flows, so the lack of flow
+	// control in revision zero doesn't matter.
+	if s.clientAcceptsSettings {
+		go func() {
+			_ = s.stream.Send(&tunnelpb.ServerToClient{
+				StreamId: -1,
+				Frame: &tunnelpb.ServerToClient_Settings{
+					Settings: &tunnelpb.Settings{
+						InitialWindowSize:          s.tunnelOpts.initialWindowSize,
+						SupportedProtocolRevisions: supportedRevisions,
+					},
 				},
-			},
-		})
-	}()
+			})
+		}()
+	}
 
 	ctx := context.WithValue(s.stream.Context(), tunnelMetadataIncomingContextKey{}, tunnelMetadata)
 	ctx, cancel := context.WithCancel(ctx)
@@ -142,18 +149,27 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 	// created, which is a protocol error that tears down the whole tunnel.
 	s.lastSeen = streamID
 
+	self, peer := tunnelRoles(s.reverse)
 	if closing {
-		return true, status.Errorf(codes.Unavailable, "server is shutting down")
+		return true, status.Errorf(codes.Unavailable, "%s is shutting down", self)
 	}
 	if frame.ProtocolRevision == tunnelpb.ProtocolRevision_REVISION_ZERO {
-		return true, status.Errorf(codes.Unavailable, "server does not support protocol revision %d anymore; upgrade client to v0.3 or later", frame.ProtocolRevision)
+		if s.clientAcceptsSettings {
+			// The client negotiated but still chose revision zero. Only v0.3
+			// does that, and only when flow control is disabled.
+			return true, status.Errorf(codes.Unavailable, "%s does not support protocol revision %d anymore; %s must not disable flow control",
+				self, frame.ProtocolRevision, peer)
+		}
+		return true, status.Errorf(codes.Unavailable, "%s does not support protocol revision %d anymore; upgrade %s to v0.3 or later",
+			self, frame.ProtocolRevision, peer)
 	}
-	if frame.ProtocolRevision != tunnelpb.ProtocolRevision_REVISION_ONE {
-		return true, status.Errorf(codes.Unavailable, "server does not support protocol revision %d", frame.ProtocolRevision)
+	if !slices.Contains(supportedRevisions, frame.ProtocolRevision) {
+		return true, status.Errorf(codes.Unavailable, "%s does not support protocol revision %d", self, frame.ProtocolRevision)
 	}
-	if frame.InitialWindowSize == 0 {
+	if minWindow := minWindowSize(frame.ProtocolRevision); frame.InitialWindowSize < minWindow {
 		// The sender could never send any data to the client.
-		return true, status.Errorf(codes.Internal, "protocol error: client sent invalid initial window size of zero")
+		return true, status.Errorf(codes.Internal, "protocol error: %s sent invalid initial window size of %d; must be at least %d",
+			peer, frame.InitialWindowSize, minWindow)
 	}
 	frame.MethodName = strings.TrimPrefix(frame.MethodName, "/")
 	parts := strings.SplitN(frame.MethodName, "/", 2)
@@ -215,16 +231,17 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 		streamName := fmt.Sprintf("svr@%p<%d>", s, streamID)
 		reqStreamName, respStreamName = streamName+":req", streamName+":resp"
 	}
-	str.sender = newSender(ctx, frame.InitialWindowSize, s.tunnelOpts.maxChunkSize, sendFunc, respStreamName)
+	msgOverhead := messageOverhead(frame.ProtocolRevision)
+	str.sender = newSender(ctx, frame.InitialWindowSize, s.tunnelOpts.maxChunkSize, msgOverhead, sendFunc, respStreamName)
 	str.receiver = newReceiver(
-		func(m tunnelpb.ClientToServerFrame) uint {
+		func(m tunnelpb.ClientToServerFrame) (uint, bool) {
 			switch m := m.(type) {
 			case *tunnelpb.ClientToServer_RequestMessage:
-				return uint(len(m.RequestMessage.Data))
+				return uint(len(m.RequestMessage.Data)), true
 			case *tunnelpb.ClientToServer_MoreRequestData:
-				return uint(len(m.MoreRequestData))
+				return uint(len(m.MoreRequestData)), false
 			default:
-				return 0
+				return 0, false
 			}
 		},
 		func(windowUpdate uint32) {
@@ -241,6 +258,7 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 		},
 		s.tunnelOpts.initialWindowSize,
 		s.tunnelOpts.minWindowUpdateSize,
+		msgOverhead,
 		reqStreamName,
 	)
 

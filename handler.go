@@ -19,6 +19,25 @@ const (
 	grpctunnelNegotiateVal = "on"
 )
 
+// tunnelRoles returns how to refer to the tunnel server and the tunnel client
+// in error messages. In a forward tunnel, the tunnel roles are the same as the
+// network roles, so these are just "server" and "client". In a reverse tunnel,
+// the network client acts as the tunnel server and the network server acts as
+// the tunnel client, so both roles are named, to make it clear which is which.
+func tunnelRoles(reverse bool) (tunnelServer, tunnelClient string) {
+	if reverse {
+		return "tunnel server (network client)", "tunnel client (network server)"
+	}
+	return "server", "client"
+}
+
+// supportedRevisions are the protocol revisions supported by this package.
+// The latest revision that both peers support is used.
+var supportedRevisions = []tunnelpb.ProtocolRevision{
+	tunnelpb.ProtocolRevision_REVISION_ONE,
+	tunnelpb.ProtocolRevision_REVISION_TWO,
+}
+
 // TunnelServiceHandler provides an implementation for TunnelServiceServer. You
 // can register handlers with it, and it will then expose those handlers for
 // incoming tunnels. If no handlers are registered, the server will reply to
@@ -72,8 +91,9 @@ type TunnelServiceHandlerOptions struct {
 	AffinityKey func(TunnelChannel) any
 	// If non-zero, sets the initial flow control window size for receiving data.
 	// (The peer sets the initial window size for sending data.) If zero, the
-	// initial window size defaults to 64k. Increasing this may increase total
-	// throughput at the cost of more memory usage.
+	// initial window size defaults to 64k. Values less than 1k will be increased
+	// to 1k. Increasing this may increase total throughput at the cost of more
+	// memory usage.
 	InitialWindowSize uint32
 	// If non-zero, sets the maximum size of a single chunk of data to send. This
 	// will be clamped to the peer's initial window size if set to a larger value.
@@ -169,7 +189,7 @@ func (s *TunnelServiceHandler) openTunnel(stream tunnelpb.TunnelService_OpenTunn
 	vals := md.Get(grpctunnelNegotiateKey)
 	clientAcceptsSettings := len(vals) > 0 && vals[0] == grpctunnelNegotiateVal
 	stream = &threadSafeOpenTunnelServer{TunnelService_OpenTunnelServer: stream}
-	return serveTunnel(stream, md, clientAcceptsSettings, &s.tunnelOpts, s.handlers, s.stopping.Load)
+	return serveTunnel(stream, md, clientAcceptsSettings, false, &s.tunnelOpts, s.handlers, s.stopping.Load)
 }
 
 // openReverseTunnel creates a reverse tunnel from this server to the RPC client.

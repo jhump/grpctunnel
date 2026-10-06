@@ -107,7 +107,7 @@ func (s *ReverseTunnelServer) Serve(ctx context.Context, opts ...grpc.CallOption
 		return false, err
 	}
 	defer s.wg.Done()
-	err = serveTunnel(stream, reqMD, clientAcceptsSettings, &s.opts, s.handlers, s.isClosing)
+	err = serveTunnel(stream, reqMD, clientAcceptsSettings, true, &s.opts, s.handlers, s.isClosing)
 	if errors.Is(err, context.Canceled) && ctx.Err() == nil && s.isClosed() {
 		// If we get back a cancelled error, but the given context is not
 		// cancelled and this server is closed, then the cancellation was
@@ -122,7 +122,8 @@ func (s *ReverseTunnelServer) addInstance(stream tunnelpb.TunnelService_OpenReve
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state >= stateClosing {
-		return status.Errorf(codes.Unavailable, "server is shutting down")
+		self, _ := tunnelRoles(true)
+		return status.Errorf(codes.Unavailable, "%s is shutting down", self)
 	}
 	s.wg.Add(1)
 	if s.instances == nil {

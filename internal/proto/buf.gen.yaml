@@ -1,8 +1,8 @@
 version: v1
 plugins:
-  - plugin: buf.build/protocolbuffers/go
+  - plugin: buf.build/protocolbuffers/go:v1.36.9
     out: ../
     opt: [Mgrpctunnel/testing/testing.proto=./gen]
-  - plugin: buf.build/grpc/go
+  - plugin: buf.build/grpc/go:v1.5.1
     out: ../
     opt: [Mgrpctunnel/testing/testing.proto=./gen]

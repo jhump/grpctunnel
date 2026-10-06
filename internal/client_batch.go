@@ -10,17 +10,19 @@ import (
 
 	"github.com/fullstorydev/grpchan/grpchantesting"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-// SendRPCs uses four goroutines to send batches of RPCs of all types (unary,
-// client-, server-, and bidi-streaaming) using the given client.
+// SendRPCs uses five goroutines to send batches of RPCs of all types (unary,
+// client-, server-, and bidi-streaming) using the given client. One of them
+// sends only empty messages.
 func SendRPCs(ctx context.Context, client grpchantesting.TestServiceClient) error {
 	var done atomic.Bool
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	grp, ctx := errgroup.WithContext(ctx)
 	type action func(context.Context, grpchantesting.TestServiceClient) error
-	for _, fn := range []action{doUnary, doClientStream, doServerStream, doBidiStream} {
+	for _, fn := range []action{doUnary, doClientStream, doServerStream, doBidiStream, doEmpty} {
 		grp.Go(func() error {
 			for {
 				if done.Load() {
@@ -56,6 +58,10 @@ func doClientStream(ctx context.Context, client grpchantesting.TestServiceClient
 			Count:   10,
 			Payload: bytes.Repeat([]byte{0, 1, 2, 3}, 10000),
 		})
+		if errors.Is(err, io.EOF) {
+			// The stream has ended. The actual status comes from CloseAndRecv.
+			break
+		}
 		if err != nil {
 			return err
 		}
@@ -109,4 +115,33 @@ func doBidiStream(ctx context.Context, client grpchantesting.TestServiceClient) 
 			return err
 		}
 	}
+}
+
+// doEmpty sends empty request messages and receives empty response messages.
+// Empty messages consume flow control window only in protocol revision two and
+// later.
+func doEmpty(ctx context.Context, client grpchantesting.TestServiceClient) error {
+	stream, err := client.ClientStream(ctx)
+	if err != nil {
+		return err
+	}
+	for range 100 {
+		err := stream.Send(&grpchantesting.Message{})
+		if errors.Is(err, io.EOF) {
+			// The stream has ended. The actual status comes from CloseAndRecv.
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := stream.CloseAndRecv(); err != nil {
+		return err
+	}
+	for range 10 {
+		if _, err := client.UseExternalMessageTwice(ctx, &emptypb.Empty{}); err != nil {
+			return err
+		}
+	}
+	return nil
 }

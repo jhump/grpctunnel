@@ -9,8 +9,9 @@ type TunnelOption interface {
 // WithInitialWindowSize configures the initial flow control window size for
 // receiving data. (The peer sets the initial window size for sending data.) If
 // this option is not used or if this option is used to set the value to zero,
-// a default value of 64k will be used. Increasing this may increase total
-// throughput at the cost of more memory usage.
+// a default value of 64k will be used. Values less than 1k will be increased to
+// 1k. Increasing this may increase total throughput at the cost of more memory
+// usage.
 func WithInitialWindowSize(size uint32) TunnelOption {
 	return tunnelOptFunc(func(t *tunnelOpts) {
 		t.initialWindowSize = size
@@ -60,6 +61,8 @@ func initOptions(t *tunnelOpts, opts []TunnelOption) {
 	}
 	if t.initialWindowSize == 0 {
 		t.initialWindowSize = defaultInitialWindowSize
+	} else if t.initialWindowSize < minInitialWindowSize {
+		t.initialWindowSize = minInitialWindowSize
 	}
 	if t.maxChunkSize == 0 {
 		t.maxChunkSize = defaultChunkMax

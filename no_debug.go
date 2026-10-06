@@ -4,7 +4,7 @@ package grpctunnel
 
 const debugEnabled = false
 
-func logSend(stream string, chunkIndex int, chunkSize, totalMsgSize, windowRemaining uint32) {
+func logSend(stream string, chunkIndex int, chunkSize, overhead, totalMsgSize, windowRemaining uint32) {
 	// no-op without debug build tag
 }
 

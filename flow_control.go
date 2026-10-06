@@ -12,13 +12,43 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/jhump/grpctunnel/tunnelpb"
 )
 
 const (
 	defaultInitialWindowSize = 64 * 1024
+	minInitialWindowSize     = 1024
 	defaultChunkMax          = 16 * 1024
 	defaultUpdateMin         = 16 * 1024
+
+	// revisionTwoMessageOverhead is the number of bytes charged against the
+	// flow control window for each message, in addition to the message data,
+	// starting with revision two of the protocol.
+	revisionTwoMessageOverhead = 5
 )
+
+// messageOverhead returns the number of bytes charged against the flow control
+// window for each message, in addition to the message data, for the given
+// protocol revision. In revision one, only message data is charged, so empty
+// messages are not subject to flow control.
+//
+// This, along with minWindowSize, is how the protocol revision of a stream is
+// translated into flow control behavior. Senders and receivers only look at the
+// resulting overhead, not at the revision.
+func messageOverhead(revision tunnelpb.ProtocolRevision) uint32 {
+	if revision >= tunnelpb.ProtocolRevision_REVISION_TWO {
+		return revisionTwoMessageOverhead
+	}
+	return 0
+}
+
+// minWindowSize returns the smallest valid initial window size for the given
+// protocol revision. The window must have room for the overhead of a message
+// plus at least one byte of data.
+func minWindowSize(revision tunnelpb.ProtocolRevision) uint32 {
+	return messageOverhead(revision) + 1
+}
 
 var errFlowControlWindowExceeded = status.Errorf(codes.ResourceExhausted, "flow control window exceeded")
 
@@ -31,6 +61,7 @@ type sender struct {
 	ctx           context.Context
 	streamName    string
 	maxChunkSize  uint32
+	msgOverhead   uint32
 	sendFunc      func([]byte, uint32, bool) error
 	windowUpdates chan struct{}
 	currentWindow atomic.Uint32
@@ -42,7 +73,7 @@ type sender struct {
 
 func newSender(
 	ctx context.Context,
-	initialWindowSize, maxChunkSize uint32,
+	initialWindowSize, maxChunkSize, msgOverhead uint32,
 	sendFunc func([]byte, uint32, bool) error,
 	streamName string,
 ) *sender {
@@ -53,6 +84,7 @@ func newSender(
 		ctx:           ctx,
 		streamName:    streamName,
 		maxChunkSize:  maxChunkSize,
+		msgOverhead:   msgOverhead,
 		sendFunc:      sendFunc,
 		windowUpdates: make(chan struct{}, 1),
 	}
@@ -66,9 +98,9 @@ func (s *sender) updateWindow(add uint32) {
 	}
 	prevWindow := s.currentWindow.Add(add) - add
 	logSenderUpdate(s.streamName, add, prevWindow)
-	if prevWindow == 0 {
-		// Window changed from zero to non-zero, so unblock any sender
-		// that was waiting to send more data.
+	if prevWindow <= s.msgOverhead {
+		// The window may have been too small to send anything, so unblock
+		// any sender that was waiting to send more data.
 		select {
 		case s.windowUpdates <- struct{}{}:
 		default:
@@ -88,7 +120,15 @@ func (s *sender) send(data []byte) error {
 	for {
 		windowSz := s.currentWindow.Load()
 
-		if windowSz == 0 {
+		// The first chunk of a message is also charged the per-message overhead.
+		var overhead uint32
+		if chunkIndex == 0 {
+			overhead = s.msgOverhead
+		}
+		// We need room for the overhead plus at least one byte of data (just the
+		// overhead if the message is empty). But we always need at least one byte.
+		needed := max(overhead+min(uint32(len(data)), 1), 1)
+		if windowSz < needed {
 			// must wait for window size update before we can send more
 			select {
 			case <-s.windowUpdates:
@@ -98,11 +138,11 @@ func (s *sender) send(data []byte) error {
 			continue
 		}
 
-		chunkSz := min(windowSz, uint32(len(data)), s.maxChunkSize)
-		if !s.currentWindow.CompareAndSwap(windowSz, windowSz-chunkSz) {
+		chunkSz := min(windowSz-overhead, uint32(len(data)), s.maxChunkSize)
+		if !s.currentWindow.CompareAndSwap(windowSz, windowSz-overhead-chunkSz) {
 			continue
 		}
-		logSend(s.streamName, chunkIndex, chunkSz, uint32(len(data)), windowSz)
+		logSend(s.streamName, chunkIndex, chunkSz, overhead, uint32(len(data)), windowSz)
 
 		last := chunkSz == uint32(len(data))
 		if err := s.sendFunc(data[:chunkSz], size, chunkIndex == 0); err != nil {
@@ -128,10 +168,13 @@ func (s *sender) send(data []byte) error {
 // sender will respect the flow control window. A misbehaving sender will be detected
 // and messages rejected if the flow control window is exceeded.
 type receiver[T any] struct {
-	streamName    string
-	measure       func(T) uint
+	streamName string
+	// measure returns the size of the data in the given item and whether the
+	// item is the first chunk of a message (so is also charged the overhead).
+	measure       func(T) (size uint, msgStart bool)
 	updateWindow  func(uint32)
 	minUpdateSize uint32
+	msgOverhead   uint32
 
 	mu                sync.Mutex
 	cond              sync.Cond
@@ -142,9 +185,9 @@ type receiver[T any] struct {
 }
 
 func newReceiver[T any](
-	measure func(T) uint,
+	measure func(T) (size uint, msgStart bool),
 	updateWindow func(uint32),
-	initialWindowSize, minUpdateSize uint32,
+	initialWindowSize, minUpdateSize, msgOverhead uint32,
 	streamName string,
 ) *receiver[T] {
 	if minUpdateSize > initialWindowSize {
@@ -155,6 +198,7 @@ func newReceiver[T any](
 		measure:       measure,
 		updateWindow:  updateWindow,
 		minUpdateSize: minUpdateSize,
+		msgOverhead:   msgOverhead,
 		items:         list.New(),
 		currentWindow: initialWindowSize,
 	}
@@ -162,8 +206,18 @@ func newReceiver[T any](
 	return rcvr
 }
 
+// charge returns the number of bytes of the flow control window that the given
+// item consumes.
+func (r *receiver[T]) charge(item T) uint {
+	sz, msgStart := r.measure(item)
+	if msgStart {
+		sz += uint(r.msgOverhead)
+	}
+	return sz
+}
+
 func (r *receiver[T]) accept(item T) error {
-	sz := r.measure(item)
+	sz := r.charge(item)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
@@ -222,9 +276,17 @@ func (r *receiver[T]) dequeue() (T, bool) {
 		element := r.items.Front()
 		if element != nil {
 			item := r.items.Remove(element).(T)
-			sz := r.measure(item)
+			sz := r.charge(item)
 			newWindowUpdate := r.windowUpdate + uint32(sz)
 			doSend := newWindowUpdate >= r.minUpdateSize
+			if !doSend && r.msgOverhead > 0 && newWindowUpdate > 0 && r.currentWindow <= r.msgOverhead {
+				// The sender's window may be too small to send the next message,
+				// so we can't wait until we have minUpdateSize to acknowledge.
+				// (When there is no message overhead, the sender only stalls when
+				// its window is zero, at which point we will have acknowledged
+				// the entire initial window, which is at least minUpdateSize.)
+				doSend = true
+			}
 			logReceiverAck(r.streamName, sz, newWindowUpdate, r.currentWindow, doSend)
 			if doSend {
 				r.currentWindow += newWindowUpdate
