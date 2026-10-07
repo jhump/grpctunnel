@@ -138,10 +138,10 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 	_, ok := s.streams[streamID]
 	if ok {
 		// stream already active!
-		return false, fmt.Errorf("cannot create stream ID %d: already exists", streamID)
+		return false, status.Errorf(codes.Internal, "protocol error: cannot create stream ID %d: already exists", streamID)
 	}
 	if streamID <= s.lastSeen {
-		return false, fmt.Errorf("cannot create stream ID %d: that ID has already been used", streamID)
+		return false, status.Errorf(codes.Internal, "protocol error: cannot create stream ID %d: that ID has already been used", streamID)
 	}
 	// This must be recorded before any of the checks below that reject only
 	// this stream. Otherwise, subsequent frames that the client sends for the
@@ -311,7 +311,7 @@ func (s *tunnelServer) getStream(streamID int64) (*tunnelServerStream, error) {
 			return nil, nil
 		}
 		// stream never created!
-		return nil, fmt.Errorf("received frame for stream ID %d: stream never created", streamID)
+		return nil, status.Errorf(codes.Internal, "protocol error: received frame for stream ID %d: stream never created", streamID)
 	}
 
 	return target, nil
@@ -390,7 +390,7 @@ func (st *tunnelServerStream) acceptClientFrame(frame tunnelpb.ClientToServerFra
 		st.sender.updateWindow(frame.WindowUpdate)
 
 	case nil:
-		st.finishStream(errors.New("protocol error: unrecognized frame type"))
+		st.finishStream(status.Error(codes.Internal, "protocol error: unrecognized frame type"))
 
 	default:
 		if err := st.receiver.accept(frame); err != nil {

@@ -31,12 +31,18 @@ func startEstablishment(ctx context.Context, timeout time.Duration, peer string)
 	ctx, cancel := context.WithCancelCause(ctx)
 	est := &establishment{cancel: cancel}
 	if timeout > 0 {
-		est.err = status.Errorf(codes.FailedPrecondition,
-			"timed out after %v waiting to establish tunnel with %s; it may be unresponsive or using an unsupported version of grpctunnel",
-			timeout, peer)
+		est.err = establishmentTimeoutError(timeout, peer)
 		est.timer = time.AfterFunc(timeout, func() { cancel(est.err) })
 	}
 	return ctx, est
+}
+
+// establishmentTimeoutError returns the error for a tunnel that could not be
+// established with the given peer within the given timeout.
+func establishmentTimeoutError(timeout time.Duration, peer string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"timed out after %v waiting to establish tunnel with %s; it may be unresponsive or using an unsupported version of grpctunnel",
+		timeout, peer)
 }
 
 // done must be called exactly once: when the tunnel is established, or when

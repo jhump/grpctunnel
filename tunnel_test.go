@@ -418,9 +418,10 @@ func newTestHandler(svc grpchantesting.TestServiceServer, opts ...TunnelOption) 
 			}
 			return vals[0]
 		},
-		InitialWindowSize:   options.initialWindowSize,
-		MaxChunkSize:        options.maxChunkSize,
-		MinWindowUpdateSize: options.minWindowUpdateSize,
+		InitialWindowSize:    options.initialWindowSize,
+		MaxChunkSize:         options.maxChunkSize,
+		MinWindowUpdateSize:  options.minWindowUpdateSize,
+		EstablishmentTimeout: options.establishmentTimeout,
 	})
 	grpchantesting.RegisterTestServiceServer(ts, svc)
 	// recursive: tunnels can be run on top of tunnels

@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/fullstorydev/grpchan"
 	"google.golang.org/grpc"
@@ -115,6 +116,14 @@ type TunnelServiceHandlerOptions struct {
 	// uses large messages, could mean an increase in latency while the sender waits
 	// for the large update window message before it can send more data.
 	MinWindowUpdateSize uint32
+	// Limits how long it can take to establish a reverse tunnel, opened by a
+	// client that uses a ReverseTunnelServer. If the tunnel is not established
+	// within this time, it fails with a FailedPrecondition error. If zero, the
+	// default of 15 seconds is used. If negative, there is no limit.
+	//
+	// This does not apply to forward tunnels: the client limits how long it
+	// can take to establish those (see WithEstablishmentTimeout).
+	EstablishmentTimeout time.Duration
 }
 
 // NewTunnelServiceHandler creates a new TunnelServiceHandler. The options are
@@ -134,9 +143,10 @@ func NewTunnelServiceHandler(options TunnelServiceHandlerOptions) *TunnelService
 		reverse:                   newReverseChannels(),
 		reverseByKey:              map[any]*reverseChannels{},
 		tunnelOpts: tunnelOpts{
-			initialWindowSize:   options.InitialWindowSize,
-			maxChunkSize:        options.MaxChunkSize,
-			minWindowUpdateSize: options.MinWindowUpdateSize,
+			initialWindowSize:    options.InitialWindowSize,
+			maxChunkSize:         options.MaxChunkSize,
+			minWindowUpdateSize:  options.MinWindowUpdateSize,
+			establishmentTimeout: options.EstablishmentTimeout,
 		},
 	}
 	initOptions(&handler.tunnelOpts, nil)
@@ -210,6 +220,12 @@ func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_O
 
 	ch := newReverseChannel(stream, &s.tunnelOpts, s.unregister)
 	defer ch.Close()
+	select {
+	case <-ch.Done():
+		// The tunnel was never established.
+		return ch.Err()
+	default:
+	}
 
 	var key any
 	if s.affinityKey != nil {

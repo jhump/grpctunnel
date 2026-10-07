@@ -203,6 +203,20 @@ func TestTunnelServiceHandler_RejectsRevisionZeroReverseTunnel(t *testing.T) {
 	_, err = stream.Recv()
 	require.ErrorContains(t, err, "tunnel client (network server) does not support protocol revision 0 anymore; "+
 		"upgrade tunnel server (network client) to v0.3 or later")
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+}
+
+func TestTunnelChannel_ClosedChannelError(t *testing.T) {
+	var svr grpchantesting.TestServer
+	tunnelCli, _ := setupInProcessServer(&svr)
+	ch, err := NewChannel(tunnelCli).Start(t.Context())
+	require.NoError(t, err)
+	ch.Close()
+	<-ch.Done()
+	// Same as a grpc.ClientConn that has been closed.
+	_, err = grpchantesting.NewTestServiceClient(ch).Unary(t.Context(), &grpchantesting.Message{})
+	require.Equal(t, codes.Canceled, status.Code(err))
+	require.ErrorContains(t, err, "channel is closed")
 }
 
 func TestTunnelServer_RejectsBadNewStream(t *testing.T) {
@@ -336,6 +350,7 @@ func TestTunnelChannel_NegotiatesRevision(t *testing.T) {
 		// either the revision the client should use or the error it should report
 		expectRevision tunnelpb.ProtocolRevision
 		expectErr      string
+		expectCode     codes.Code
 	}{
 		{
 			// like a v0.3 server
@@ -361,6 +376,7 @@ func TestTunnelChannel_NegotiatesRevision(t *testing.T) {
 			name:         "no-negotiation",
 			revisionZero: true,
 			expectErr:    "client does not support protocol revision 0 anymore; upgrade server to v0.3 or later",
+			expectCode:   codes.FailedPrecondition,
 		},
 		{
 			// like a v0.3 server with flow control disabled
@@ -368,12 +384,14 @@ func TestTunnelChannel_NegotiatesRevision(t *testing.T) {
 			revisions:  revisions(zero),
 			windowSize: defaultInitialWindowSize,
 			expectErr:  "client does not support protocol revision 0 anymore; server must not disable flow control",
+			expectCode: codes.FailedPrecondition,
 		},
 		{
 			name:       "zero-window",
 			revisions:  revisions(one),
 			windowSize: 0,
 			expectErr:  "initial window size",
+			expectCode: codes.Internal,
 		},
 		{
 			name:           "small-window-ok-for-revision-one",
@@ -386,6 +404,7 @@ func TestTunnelChannel_NegotiatesRevision(t *testing.T) {
 			revisions:  revisions(one, two),
 			windowSize: 5,
 			expectErr:  "initial window size",
+			expectCode: codes.Internal,
 		},
 	}
 	for _, testCase := range testCases {
@@ -411,9 +430,11 @@ func TestTunnelChannel_NegotiatesRevision(t *testing.T) {
 					t.Fatal("tunnel was not closed after receiving bad settings")
 				}
 				require.ErrorContains(t, ch.Err(), testCase.expectErr)
+				require.Equal(t, testCase.expectCode, status.Code(ch.Err()))
 				// RPCs should also report the reason the tunnel was closed.
 				_, err := grpchantesting.NewTestServiceClient(ch).Unary(t.Context(), &grpchantesting.Message{})
 				require.ErrorContains(t, err, testCase.expectErr)
+				require.Equal(t, testCase.expectCode, status.Code(err))
 				return
 			}
 

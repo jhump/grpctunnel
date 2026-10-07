@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -69,9 +70,9 @@ func (p *pendingChannel) Start(ctx context.Context, opts ...grpc.CallOption) (Tu
 	serverSendsSettings := len(vals) > 0 && vals[0] == grpctunnelNegotiateVal
 	reqMD, _ := metadata.FromOutgoingContext(stream.Context())
 	stream = &threadSafeOpenTunnelClient{TunnelService_OpenTunnelClient: stream}
-	// This waits for the server's settings, so the tunnel is established
-	// when this returns.
 	ch := newTunnelChannel(stream, reqMD, serverSendsSettings, false, &p.opts, func(*tunnelChannel) { _ = stream.CloseSend() }, est.release)
+	// The tunnel isn't established until we get the server's settings.
+	ch.waitForSettings()
 	if err := est.done(nil); err != nil {
 		ch.Close()
 		return nil, err
@@ -84,7 +85,23 @@ func newReverseChannel(stream tunnelpb.TunnelService_OpenReverseTunnelServer, op
 	vals := md.Get(grpctunnelNegotiateKey)
 	serverSendsSettings := len(vals) > 0 && vals[0] == grpctunnelNegotiateVal
 	stream = &threadSafeOpenReverseTunnelServer{TunnelService_OpenReverseTunnelServer: stream}
-	return newTunnelChannel(stream, md, serverSendsSettings, true, opts, onClose, nil)
+	c := newTunnelChannel(stream, md, serverSendsSettings, true, opts, onClose, nil)
+	if opts.establishmentTimeout > 0 {
+		// The tunnel isn't established until we get the settings from the
+		// tunnel server (which, for a reverse tunnel, is the network client).
+		peer, _ := tunnelRoles(true)
+		timer := time.AfterFunc(opts.establishmentTimeout, func() {
+			select {
+			case <-c.awaitSettings:
+				// already established
+			default:
+				c.close(establishmentTimeoutError(opts.establishmentTimeout, peer))
+			}
+		})
+		defer timer.Stop()
+	}
+	c.waitForSettings()
+	return c
 }
 
 // TunnelChannel is a special gRPC connection that uses a gRPC stream (a tunnel)
@@ -232,14 +249,16 @@ func newTunnelChannel(stream tunnelStreamClient, tunnelMetadata metadata.MD, ser
 		awaitSettings:       make(chan struct{}),
 	}
 	go c.recvLoop()
+	return c
+}
 
-	// make sure we've gotten settings from the server before we return
+// waitForSettings blocks until the server's settings have been received or
+// the tunnel fails.
+func (c *tunnelChannel) waitForSettings() {
 	select {
 	case <-c.awaitSettings:
-	case <-ctx.Done():
+	case <-c.ctx.Done():
 	}
-
-	return c
 }
 
 func (c *tunnelChannel) Context() context.Context {
@@ -347,14 +366,17 @@ func (c *tunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 	defer c.mu.Unlock()
 
 	if c.finished {
-		if c.err != nil {
-			return nil, nil, fmt.Errorf("channel is closed: %w", c.err)
+		if c.err != nil && c.err != io.EOF {
+			// Convey the reason the channel was closed.
+			st := toStatus(c.err)
+			return nil, nil, status.Errorf(st.Code(), "channel is closed: %s", st.Message())
 		}
-		return nil, nil, errors.New("channel is closed")
+		// Same code as a grpc.ClientConn that is closed.
+		return nil, nil, status.Error(codes.Canceled, "channel is closed")
 	}
 
 	if c.lastStreamID < 0 {
-		return nil, nil, errors.New("all stream IDs exhausted (must create a new channel)")
+		return nil, nil, status.Error(codes.ResourceExhausted, "all stream IDs exhausted (must create a new channel)")
 	}
 
 	c.streamCreated = true
@@ -362,7 +384,7 @@ func (c *tunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 	streamID := c.lastStreamID
 	if _, ok := c.streams[streamID]; ok {
 		// should never happen... panic?
-		return nil, nil, errors.New("next stream ID not available")
+		return nil, nil, status.Error(codes.Internal, "next stream ID not available")
 	}
 
 	md, _ := metadata.FromOutgoingContext(ctx)
@@ -390,7 +412,8 @@ func (c *tunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 
 		case grpc.PerRPCCredsCallOption:
 			if opt.Creds.RequireTransportSecurity() && !isSecure {
-				return nil, nil, fmt.Errorf("per-RPC credentials %T cannot be used with insecure channel", opt.Creds)
+				// Same code as a grpc.ClientConn in this situation.
+				return nil, nil, status.Errorf(codes.Unauthenticated, "per-RPC credentials %T cannot be used with insecure channel", opt.Creds)
 			}
 
 			mdVals, err := opt.Creds.GetRequestMetadata(ctx, fmt.Sprintf("tunnel://%s%s", authority, methodName))
@@ -496,22 +519,23 @@ func (c *tunnelChannel) recvLoop() {
 	}
 	peer, self := tunnelRoles(c.reverse)
 	if !c.serverSendsSettings {
-		c.close(fmt.Errorf("%s does not support protocol revision %d anymore; upgrade %s to v0.3 or later",
+		c.close(status.Errorf(codes.FailedPrecondition, "%s does not support protocol revision %d anymore; upgrade %s to v0.3 or later",
 			self, tunnelpb.ProtocolRevision_REVISION_ZERO, peer))
 		return
 	}
 	in, err := c.stream.Recv()
 	if err != nil {
-		c.close(fmt.Errorf("failed to read settings from %s: %w", peer, err))
+		st := toStatus(err)
+		c.close(status.Errorf(st.Code(), "failed to read settings from %s: %s", peer, st.Message()))
 		return
 	}
 	if in.StreamId != -1 {
-		c.close(fmt.Errorf("protocol error: settings frame had bad stream ID (%d)", in.StreamId))
+		c.close(status.Errorf(codes.Internal, "protocol error: settings frame had bad stream ID (%d)", in.StreamId))
 		return
 	}
 	settings, ok := in.Frame.(*tunnelpb.ServerToClient_Settings)
 	if !ok {
-		c.close(fmt.Errorf("protocol error: first frame was not settings (instead was %T)", in.Frame))
+		c.close(status.Errorf(codes.Internal, "protocol error: first frame was not settings (instead was %T)", in.Frame))
 		return
 	}
 	var v0supported bool
@@ -528,17 +552,17 @@ func (c *tunnelChannel) recvLoop() {
 		if v0supported {
 			// The server negotiated but only supports revision zero. Only v0.3
 			// does that, and only when flow control is disabled.
-			c.close(fmt.Errorf("%s does not support protocol revision %d anymore; %s must not disable flow control",
+			c.close(status.Errorf(codes.FailedPrecondition, "%s does not support protocol revision %d anymore; %s must not disable flow control",
 				self, tunnelpb.ProtocolRevision_REVISION_ZERO, peer))
 		} else {
-			c.close(fmt.Errorf("protocol error: %s supports revisions %v, but %s supports revisions %v",
+			c.close(status.Errorf(codes.FailedPrecondition, "%s supports revisions %v, but %s supports revisions %v",
 				peer, settings.Settings.SupportedProtocolRevisions, self, supportedRevisions))
 		}
 		return
 	}
 	if minWindow := minWindowSize(c.useRevision); settings.Settings.InitialWindowSize < minWindow {
 		// Streams could never send any data to the server.
-		c.close(fmt.Errorf("protocol error: %s sent invalid initial window size of %d; must be at least %d",
+		c.close(status.Errorf(codes.Internal, "protocol error: %s sent invalid initial window size of %d; must be at least %d",
 			peer, settings.Settings.InitialWindowSize, minWindow))
 		return
 	}
@@ -572,7 +596,7 @@ func (c *tunnelChannel) getStream(streamID int64) (*tunnelClientStream, error) {
 			return nil, nil
 		}
 		// stream never created!
-		return nil, fmt.Errorf("received frame for stream ID %d: stream never created", streamID)
+		return nil, status.Errorf(codes.Internal, "protocol error: received frame for stream ID %d: stream never created", streamID)
 	}
 
 	return target, nil
@@ -584,6 +608,14 @@ func (c *tunnelChannel) removeStream(streamID int64) {
 	if c.streams != nil {
 		delete(c.streams, streamID)
 	}
+}
+
+// toStatus converts the given error to a status, including context errors.
+func toStatus(err error) *status.Status {
+	if st, ok := status.FromError(err); ok {
+		return st
+	}
+	return status.FromContextError(err)
 }
 
 func (c *tunnelChannel) close(err error) bool {
@@ -834,7 +866,7 @@ func (st *tunnelClientStream) acceptServerFrame(frame tunnelpb.ServerToClientFra
 
 	switch frame := frame.(type) {
 	case *tunnelpb.ServerToClient_Settings:
-		st.finishStream(errors.New("protocol error: unexpected settings frame"), nil)
+		st.finishStream(status.Error(codes.Internal, "protocol error: unexpected settings frame"), nil)
 
 	case *tunnelpb.ServerToClient_ResponseHeaders:
 		st.metaMu.Lock()
@@ -859,7 +891,7 @@ func (st *tunnelClientStream) acceptServerFrame(frame tunnelpb.ServerToClientFra
 		st.sender.updateWindow(frame.WindowUpdate)
 
 	case nil:
-		st.finishStream(errors.New("protocol error: unrecognized frame type"), nil)
+		st.finishStream(status.Error(codes.Internal, "protocol error: unrecognized frame type"), nil)
 
 	default:
 		if err := st.receiver.accept(frame); err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -135,6 +136,75 @@ func TestEstablishmentTimeout_DoesNotAffectEstablishedTunnel(t *testing.T) {
 		_, err = grpchantesting.NewTestServiceClient(ts.AsChannel()).Unary(t.Context(), &grpchantesting.Message{})
 		require.NoError(t, err)
 	})
+}
+
+func TestEstablishmentTimeout_TunnelServiceHandler(t *testing.T) {
+	// For reverse tunnels, the handler is the tunnel client, so it waits for
+	// settings from the tunnel server (the network client).
+	testCases := []struct {
+		name          string
+		timeout       time.Duration
+		expectTimeout time.Duration
+	}{
+		{
+			name:          "default",
+			expectTimeout: defaultEstablishmentTimeout,
+		},
+		{
+			name:          "custom",
+			timeout:       time.Second,
+			expectTimeout: time.Second,
+		},
+		{
+			name:    "no-limit",
+			timeout: -1,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var opened atomic.Int32
+				ts := NewTunnelServiceHandler(TunnelServiceHandlerOptions{
+					EstablishmentTimeout: testCase.timeout,
+					OnReverseTunnelOpen:  func(TunnelChannel) { opened.Add(1) },
+				})
+				var inproc inprocgrpc.Channel
+				tunnelpb.RegisterTunnelServiceServer(&inproc, ts.Service())
+				// Like a ReverseTunnelServer that negotiates but never sends settings.
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				ctx = metadata.AppendToOutgoingContext(ctx, grpctunnelNegotiateKey, grpctunnelNegotiateVal)
+				stream, err := tunnelpb.NewTunnelServiceClient(&inproc).OpenReverseTunnel(ctx)
+				require.NoError(t, err)
+				start := time.Now()
+				recvDone := make(chan error, 1)
+				go func() {
+					_, err := stream.Recv()
+					recvDone <- err
+				}()
+
+				if testCase.expectTimeout == 0 {
+					time.Sleep(time.Hour)
+					synctest.Wait()
+					select {
+					case err := <-recvDone:
+						t.Fatalf("tunnel ended before client hung up: %v", err)
+					default:
+					}
+					cancel()
+					<-recvDone
+					return
+				}
+
+				err = <-recvDone
+				require.Equal(t, testCase.expectTimeout, time.Since(start))
+				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				require.ErrorContains(t, err, "timed out after "+testCase.expectTimeout.String()+
+					" waiting to establish tunnel with tunnel server (network client)")
+				require.Zero(t, opened.Load(), "OnReverseTunnelOpen should not be called for tunnel that was never established")
+			})
+		})
+	}
 }
 
 func TestTunnelStreamContextCancelledInBubble(t *testing.T) {
