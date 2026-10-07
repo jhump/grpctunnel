@@ -1,6 +1,5 @@
 # gRPC Tunnels
-[![Build Status](https://circleci.com/gh/jhump/grpctunnel/tree/main.svg?style=svg)](https://circleci.com/gh/jhump/grpctunnel/tree/main)
-[![Go Report Card](https://goreportcard.com/badge/github.com/jhump/grpctunnel)](https://goreportcard.com/report/github.com/jhump/grpctunnel)
+[![CI](https://github.com/jhump/grpctunnel/workflows/ci/badge.svg)](https://github.com/jhump/grpctunnel/actions/workflows/ci.yaml)
 [![GoDoc](https://godoc.org/github.com/jhump/grpctunnel?status.svg)](https://godoc.org/github.com/jhump/grpctunnel)
 
 This library enables carrying gRPC over gRPC. There are a few niche use cases
