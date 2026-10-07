@@ -3,6 +3,7 @@ package grpctunnel
 import (
 	"context"
 	"errors"
+	"runtime"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -133,6 +134,33 @@ func TestEstablishmentTimeout_DoesNotAffectEstablishedTunnel(t *testing.T) {
 		require.NoError(t, err)
 		_, err = grpchantesting.NewTestServiceClient(ts.AsChannel()).Unary(t.Context(), &grpchantesting.Message{})
 		require.NoError(t, err)
+	})
+}
+
+func TestTunnelStreamContextCancelledInBubble(t *testing.T) {
+	// The in-process channel only cancels a stream's context in a finalizer,
+	// which runs outside of any synctest bubble. So if we didn't cancel the
+	// context of the tunnel's stream ourselves when the tunnel is done, then
+	// garbage collection could crash the test, when the finalizer closes a
+	// channel that belongs to the bubble.
+	realDelay := make(chan struct{})
+	time.AfterFunc(200*time.Millisecond, func() { close(realDelay) })
+	synctest.Test(t, func(t *testing.T) {
+		var svr grpchantesting.TestServer
+		tunnelCli, _ := setupInProcessServer(&svr)
+		for _, opt := range []TunnelOption{WithEstablishmentTimeout(time.Second), WithEstablishmentTimeout(0)} {
+			ch, err := NewChannel(tunnelCli, opt).Start(t.Context())
+			require.NoError(t, err)
+			ch.Close()
+			<-ch.Done()
+		}
+		synctest.Wait()
+		// Collect the tunnel's stream and give its finalizer a chance to run
+		// while this bubble is still active. (Receiving from a channel that was
+		// created outside the bubble waits in real time.)
+		runtime.GC()
+		runtime.GC()
+		<-realDelay
 	})
 }
 

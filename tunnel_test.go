@@ -49,7 +49,10 @@ func TestTunnelServiceHandler_Deadlocks(t *testing.T) {
 		},
 		{
 			name: "tiny-chunk",
-			opts: []TunnelOption{WithMaxChunkSize(64)},
+			// Ideally, this would be even smaller, to stress the chunking
+			// further. But that makes this test too slow with the race
+			// detector and coverage enabled.
+			opts: []TunnelOption{WithMaxChunkSize(512)},
 		},
 		{
 			name: "oversized-chunk",

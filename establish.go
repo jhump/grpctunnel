@@ -20,18 +20,22 @@ type establishment struct {
 // If the tunnel isn't established within the given timeout, the context is
 // cancelled. If the timeout is not positive, there is no limit. The given peer
 // describes the other end of the tunnel, for use in error messages.
+//
+// The context is also cancelled when release is called, which must be done
+// once the RPC is finished. Doing this ourselves, instead of relying on the
+// transport to cancel the stream's context when the RPC finishes, ensures it
+// happens promptly with any transport. (For example, the in-process channel in
+// grpchan only cancels a stream's context when the stream is garbage
+// collected.)
 func startEstablishment(ctx context.Context, timeout time.Duration, peer string) (context.Context, *establishment) {
-	if timeout <= 0 {
-		return ctx, &establishment{}
-	}
 	ctx, cancel := context.WithCancelCause(ctx)
-	est := &establishment{
-		cancel: cancel,
-		err: status.Errorf(codes.FailedPrecondition,
+	est := &establishment{cancel: cancel}
+	if timeout > 0 {
+		est.err = status.Errorf(codes.FailedPrecondition,
 			"timed out after %v waiting to establish tunnel with %s; it may be unresponsive or using an unsupported version of grpctunnel",
-			timeout, peer),
+			timeout, peer)
+		est.timer = time.AfterFunc(timeout, func() { cancel(est.err) })
 	}
-	est.timer = time.AfterFunc(timeout, func() { cancel(est.err) })
 	return ctx, est
 }
 
@@ -49,7 +53,5 @@ func (e *establishment) done(err error) error {
 // startEstablishment. It must be called once the RPC that opens the tunnel
 // has finished.
 func (e *establishment) release() {
-	if e.cancel != nil {
-		e.cancel(nil)
-	}
+	e.cancel(nil)
 }

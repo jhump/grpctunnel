@@ -65,15 +65,13 @@ func (p *pendingChannel) Start(ctx context.Context, opts ...grpc.CallOption) (Tu
 		est.release()
 		return nil, err
 	}
-	// The stream's context is cancelled when the RPC finishes.
-	context.AfterFunc(stream.Context(), est.release)
 	vals := respMD.Get(grpctunnelNegotiateKey)
 	serverSendsSettings := len(vals) > 0 && vals[0] == grpctunnelNegotiateVal
 	reqMD, _ := metadata.FromOutgoingContext(stream.Context())
 	stream = &threadSafeOpenTunnelClient{TunnelService_OpenTunnelClient: stream}
 	// This waits for the server's settings, so the tunnel is established
 	// when this returns.
-	ch := newTunnelChannel(stream, reqMD, serverSendsSettings, false, &p.opts, func(*tunnelChannel) { _ = stream.CloseSend() })
+	ch := newTunnelChannel(stream, reqMD, serverSendsSettings, false, &p.opts, func(*tunnelChannel) { _ = stream.CloseSend() }, est.release)
 	if err := est.done(nil); err != nil {
 		ch.Close()
 		return nil, err
@@ -86,7 +84,7 @@ func newReverseChannel(stream tunnelpb.TunnelService_OpenReverseTunnelServer, op
 	vals := md.Get(grpctunnelNegotiateKey)
 	serverSendsSettings := len(vals) > 0 && vals[0] == grpctunnelNegotiateVal
 	stream = &threadSafeOpenReverseTunnelServer{TunnelService_OpenReverseTunnelServer: stream}
-	return newTunnelChannel(stream, md, serverSendsSettings, true, opts, onClose)
+	return newTunnelChannel(stream, md, serverSendsSettings, true, opts, onClose, nil)
 }
 
 // TunnelChannel is a special gRPC connection that uses a gRPC stream (a tunnel)
@@ -200,6 +198,7 @@ type tunnelChannel struct {
 	ctx                 context.Context
 	cancel              context.CancelFunc
 	tearDown            func(*tunnelChannel)
+	streamDone          func()
 
 	awaitSettings chan struct{}
 	settings      *tunnelpb.Settings
@@ -215,7 +214,9 @@ type tunnelChannel struct {
 	streamCreation sync.Mutex
 }
 
-func newTunnelChannel(stream tunnelStreamClient, tunnelMetadata metadata.MD, serverSendsSettings, reverse bool, opts *tunnelOpts, tearDown func(*tunnelChannel)) *tunnelChannel {
+// If not nil, streamDone is called when the tunnel's stream is finished (or is
+// being abandoned, due to a protocol error).
+func newTunnelChannel(stream tunnelStreamClient, tunnelMetadata metadata.MD, serverSendsSettings, reverse bool, opts *tunnelOpts, tearDown func(*tunnelChannel), streamDone func()) *tunnelChannel {
 	ctx, cancel := context.WithCancel(stream.Context())
 	c := &tunnelChannel{
 		stream:              stream,
@@ -226,6 +227,7 @@ func newTunnelChannel(stream tunnelStreamClient, tunnelMetadata metadata.MD, ser
 		ctx:                 ctx,
 		cancel:              cancel,
 		tearDown:            tearDown,
+		streamDone:          streamDone,
 		streams:             map[int64]*tunnelClientStream{},
 		awaitSettings:       make(chan struct{}),
 	}
@@ -487,6 +489,11 @@ func (c *tunnelChannel) allocateStream(ctx context.Context, clientStreams, serve
 }
 
 func (c *tunnelChannel) recvLoop() {
+	if c.streamDone != nil {
+		// This loop only exits when the stream is finished or is being
+		// abandoned (due to a protocol error).
+		defer c.streamDone()
+	}
 	peer, self := tunnelRoles(c.reverse)
 	if !c.serverSendsSettings {
 		c.close(fmt.Errorf("%s does not support protocol revision %d anymore; upgrade %s to v0.3 or later",
