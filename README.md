@@ -1,5 +1,5 @@
 # gRPC Tunnels
-[![CI](https://github.com/jhump/grpctunnel/workflows/ci/badge.svg)](https://github.com/jhump/grpctunnel/actions/workflows/ci.yaml)
+[![CI](https://github.com/jhump/grpctunnel/actions/workflows/ci.yaml/badge.svg)](https://github.com/jhump/grpctunnel/actions/workflows/ci.yaml)
 [![GoDoc](https://godoc.org/github.com/jhump/grpctunnel?status.svg)](https://godoc.org/github.com/jhump/grpctunnel)
 
 This library enables carrying gRPC over gRPC. There are a few niche use cases
