@@ -1,7 +1,12 @@
-version: v1
-breaking:
-  use:
-    - FILE
+version: v2
 lint:
   use:
     - DEFAULT
+  except:
+    # Adding a package would change the fully-qualified name of the service in
+    # this module, which would break interop testing between the test programs
+    # in internal/cmd built from this version and those built from older ones.
+    - PACKAGE_DEFINED
+breaking:
+  use:
+    - FILE

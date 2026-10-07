@@ -11,5 +11,4 @@ message TriggerTestRPCsRequest {
   string client_key = 1;
 }
 
-message TriggerTestRPCsResponse {
-}
+message TriggerTestRPCsResponse {}

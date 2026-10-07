@@ -2,6 +2,7 @@ package grpctunnel
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
 
@@ -47,9 +48,7 @@ func NewReverseTunnelServer(stub tunnelpb.TunnelServiceClient, opts ...TunnelOpt
 		handlers:  grpchan.HandlerMap{},
 		instances: map[tunnelpb.TunnelService_OpenReverseTunnelClient]struct{}{},
 	}
-	for _, opt := range opts {
-		opt.apply(&r.opts)
-	}
+	initOptions(&r.opts, opts)
 	return r
 }
 
@@ -78,6 +77,10 @@ func (s *ReverseTunnelServer) RegisterService(desc *grpc.ServiceDesc, srv any) {
 // This will be nil if the stream was closed by the other side of the tunnel
 // (the server, acting as an RPC client, hanging up).
 //
+// The given context defines the lifetime of the tunnel. To limit how long it
+// can take to establish the tunnel, use the WithEstablishmentTimeout option
+// when creating the server.
+//
 // Reasons for the tunnel ending abnormally include detection of invalid usage
 // of the stream (RPC client sending references to invalid stream IDs or sending
 // frames for a stream ID in improper order) or if the stream itself fails (for
@@ -89,12 +92,17 @@ func (s *ReverseTunnelServer) RegisterService(desc *grpc.ServiceDesc, srv any) {
 func (s *ReverseTunnelServer) Serve(ctx context.Context, opts ...grpc.CallOption) (started bool, err error) {
 	// TODO: validate options and maybe return an error
 	ctx = metadata.AppendToOutgoingContext(ctx, grpctunnelNegotiateKey, grpctunnelNegotiateVal)
-	stream, err := s.stub.OpenReverseTunnel(ctx, opts...)
+	_, peer := tunnelRoles(true)
+	streamCtx, est := startEstablishment(ctx, s.opts.establishmentTimeout, peer)
+	// By the time this returns, the RPC has either finished or is being
+	// abandoned (if the tunnel couldn't be started), so it can be cancelled.
+	defer est.release()
+	stream, err := s.stub.OpenReverseTunnel(streamCtx, opts...)
 	if err != nil {
-		return false, err
+		return false, est.done(err)
 	}
 	respMD, err := stream.Header()
-	if err != nil {
+	if err := est.done(err); err != nil {
 		return false, err
 	}
 	vals := respMD.Get(grpctunnelNegotiateKey)
@@ -108,8 +116,8 @@ func (s *ReverseTunnelServer) Serve(ctx context.Context, opts ...grpc.CallOption
 		return false, err
 	}
 	defer s.wg.Done()
-	err = serveTunnel(stream, reqMD, clientAcceptsSettings, &s.opts, s.handlers, s.isClosing)
-	if err == context.Canceled && ctx.Err() == nil && s.isClosed() {
+	err = serveTunnel(stream, reqMD, clientAcceptsSettings, true, &s.opts, s.handlers, s.isClosing)
+	if errors.Is(err, context.Canceled) && ctx.Err() == nil && s.isClosed() {
 		// If we get back a cancelled error, but the given context is not
 		// cancelled and this server is closed, then the cancellation was
 		// caused by the server stopping. In that case, no need to report
@@ -123,7 +131,8 @@ func (s *ReverseTunnelServer) addInstance(stream tunnelpb.TunnelService_OpenReve
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state >= stateClosing {
-		return status.Errorf(codes.Unavailable, "server is shutting down")
+		self, _ := tunnelRoles(true)
+		return status.Errorf(codes.Unavailable, "%s is shutting down", self)
 	}
 	s.wg.Add(1)
 	if s.instances == nil {

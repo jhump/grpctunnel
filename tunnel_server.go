@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,11 +23,12 @@ import (
 	"github.com/jhump/grpctunnel/tunnelpb"
 )
 
-func serveTunnel(stream tunnelStreamServer, tunnelMetadata metadata.MD, clientAcceptsSettings bool, opts *tunnelOpts, handlers grpchan.HandlerMap, isClosing func() bool) error {
+func serveTunnel(stream tunnelStreamServer, tunnelMetadata metadata.MD, clientAcceptsSettings, reverse bool, opts *tunnelOpts, handlers grpchan.HandlerMap, isClosing func() bool) error {
 	svr := &tunnelServer{
 		stream:                stream,
 		services:              handlers,
 		clientAcceptsSettings: clientAcceptsSettings,
+		reverse:               reverse,
 		tunnelOpts:            opts,
 		isClosing:             isClosing,
 		streams:               map[int64]*tunnelServerStream{},
@@ -45,6 +47,7 @@ type tunnelServer struct {
 	stream                tunnelStreamServer
 	services              grpchan.HandlerMap
 	clientAcceptsSettings bool
+	reverse               bool
 	tunnelOpts            *tunnelOpts
 	isClosing             func() bool
 
@@ -54,14 +57,21 @@ type tunnelServer struct {
 }
 
 func (s *tunnelServer) serve(tunnelMetadata metadata.MD) error {
+	// If the client doesn't accept settings, it only supports revision zero,
+	// which is no longer supported. But we don't fail the whole tunnel: older
+	// clients don't report the cause of the tunnel failing, so users would see
+	// a generic error (like "EOF"). Instead, each stream the client creates is
+	// rejected with an error that says to upgrade (see createStream). Since such
+	// streams are rejected immediately, no data flows, so the lack of flow
+	// control in revision zero doesn't matter.
 	if s.clientAcceptsSettings {
 		go func() {
 			_ = s.stream.Send(&tunnelpb.ServerToClient{
 				StreamId: -1,
 				Frame: &tunnelpb.ServerToClient_Settings{
 					Settings: &tunnelpb.Settings{
-						InitialWindowSize:          initialWindowSize,
-						SupportedProtocolRevisions: s.tunnelOpts.supportedRevisions(),
+						InitialWindowSize:          s.tunnelOpts.initialWindowSize,
+						SupportedProtocolRevisions: supportedRevisions,
 					},
 				},
 			})
@@ -118,15 +128,9 @@ func (s *tunnelServer) serve(tunnelMetadata metadata.MD) error {
 // itself is still valid for subsequent RPCs. This will be the case, for example, if the requested
 // method name is not implemented by the server.
 func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *tunnelpb.NewStream) (bool, error) {
-	if s.isClosing() {
-		return true, status.Errorf(codes.Unavailable, "server is shutting down")
-	}
-
-	if frame.ProtocolRevision != tunnelpb.ProtocolRevision_REVISION_ZERO &&
-		frame.ProtocolRevision != tunnelpb.ProtocolRevision_REVISION_ONE {
-		return true, status.Errorf(codes.Unavailable, "server does not support protocol revision %d", frame.ProtocolRevision)
-	}
-	noFlowControl := frame.ProtocolRevision == tunnelpb.ProtocolRevision_REVISION_ZERO
+	// Checked before acquiring s.mu, so we never hold s.mu while acquiring
+	// whatever lock isClosing may need.
+	closing := s.isClosing()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -134,16 +138,40 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 	_, ok := s.streams[streamID]
 	if ok {
 		// stream already active!
-		return false, fmt.Errorf("cannot create stream ID %d: already exists", streamID)
+		return false, status.Errorf(codes.Internal, "protocol error: cannot create stream ID %d: already exists", streamID)
 	}
 	if streamID <= s.lastSeen {
-		return false, fmt.Errorf("cannot create stream ID %d: that ID has already been used", streamID)
+		return false, status.Errorf(codes.Internal, "protocol error: cannot create stream ID %d: that ID has already been used", streamID)
 	}
+	// This must be recorded before any of the checks below that reject only
+	// this stream. Otherwise, subsequent frames that the client sends for the
+	// rejected stream would look like frames for a stream that was never
+	// created, which is a protocol error that tears down the whole tunnel.
 	s.lastSeen = streamID
 
-	if frame.MethodName[0] == '/' {
-		frame.MethodName = frame.MethodName[1:]
+	self, peer := tunnelRoles(s.reverse)
+	if closing {
+		return true, status.Errorf(codes.Unavailable, "%s is shutting down", self)
 	}
+	if frame.ProtocolRevision == tunnelpb.ProtocolRevision_REVISION_ZERO {
+		if s.clientAcceptsSettings {
+			// The client negotiated but still chose revision zero. Only v0.3
+			// does that, and only when flow control is disabled.
+			return true, status.Errorf(codes.FailedPrecondition, "%s does not support protocol revision %d anymore; %s must not disable flow control",
+				self, frame.ProtocolRevision, peer)
+		}
+		return true, status.Errorf(codes.FailedPrecondition, "%s does not support protocol revision %d anymore; upgrade %s to v0.3 or later",
+			self, frame.ProtocolRevision, peer)
+	}
+	if !slices.Contains(supportedRevisions, frame.ProtocolRevision) {
+		return true, status.Errorf(codes.FailedPrecondition, "%s does not support protocol revision %d", self, frame.ProtocolRevision)
+	}
+	if minWindow := minWindowSize(frame.ProtocolRevision); frame.InitialWindowSize < minWindow {
+		// The sender could never send any data to the client.
+		return true, status.Errorf(codes.Internal, "protocol error: %s sent invalid initial window size of %d; must be at least %d",
+			peer, frame.InitialWindowSize, minWindow)
+	}
+	frame.MethodName = strings.TrimPrefix(frame.MethodName, "/")
 	parts := strings.SplitN(frame.MethodName, "/", 2)
 	if len(parts) != 2 {
 		return true, status.Errorf(codes.InvalidArgument, "%s is not a well-formed method name", frame.MethodName)
@@ -198,37 +226,41 @@ func (s *tunnelServer) createStream(ctx context.Context, streamID int64, frame *
 			},
 		})
 	}
-	if noFlowControl {
-		str.sender = newSenderWithoutFlowControl(sendFunc)
-		str.receiver = newReceiverWithoutFlowControl[tunnelpb.ClientToServerFrame](ctx)
-	} else {
-		str.sender = newSender(ctx, frame.InitialWindowSize, sendFunc)
-		str.receiver = newReceiver(
-			func(m tunnelpb.ClientToServerFrame) uint {
-				switch m := m.(type) {
-				case *tunnelpb.ClientToServer_RequestMessage:
-					return uint(len(m.RequestMessage.Data))
-				case *tunnelpb.ClientToServer_MoreRequestData:
-					return uint(len(m.MoreRequestData))
-				default:
-					return 0
-				}
-			},
-			func(windowUpdate uint32) {
-				if str.loadHalfClosed() != nil {
-					// stream already half-closed, no more data coming
-					return
-				}
-				_ = s.stream.Send(&tunnelpb.ServerToClient{
-					StreamId: streamID,
-					Frame: &tunnelpb.ServerToClient_WindowUpdate{
-						WindowUpdate: windowUpdate,
-					},
-				})
-			},
-			initialWindowSize,
-		)
+	var reqStreamName, respStreamName string
+	if debugEnabled {
+		streamName := fmt.Sprintf("svr@%p<%d>", s, streamID)
+		reqStreamName, respStreamName = streamName+":req", streamName+":resp"
 	}
+	msgOverhead := messageOverhead(frame.ProtocolRevision)
+	str.sender = newSender(ctx, frame.InitialWindowSize, s.tunnelOpts.maxChunkSize, msgOverhead, sendFunc, respStreamName)
+	str.receiver = newReceiver(
+		func(m tunnelpb.ClientToServerFrame) (uint, bool) {
+			switch m := m.(type) {
+			case *tunnelpb.ClientToServer_RequestMessage:
+				return uint(len(m.RequestMessage.Data)), true
+			case *tunnelpb.ClientToServer_MoreRequestData:
+				return uint(len(m.MoreRequestData)), false
+			default:
+				return 0, false
+			}
+		},
+		func(windowUpdate uint32) {
+			if str.loadHalfClosed() != nil {
+				// stream already half-closed, no more data coming
+				return
+			}
+			_ = s.stream.Send(&tunnelpb.ServerToClient{
+				StreamId: streamID,
+				Frame: &tunnelpb.ServerToClient_WindowUpdate{
+					WindowUpdate: windowUpdate,
+				},
+			})
+		},
+		s.tunnelOpts.initialWindowSize,
+		s.tunnelOpts.minWindowUpdateSize,
+		msgOverhead,
+		reqStreamName,
+	)
 
 	s.streams[streamID] = str
 	str.ctx = grpc.NewContextWithServerTransportStream(str.ctx, (*tunnelServerTransportStream)(str))
@@ -279,7 +311,7 @@ func (s *tunnelServer) getStream(streamID int64) (*tunnelServerStream, error) {
 			return nil, nil
 		}
 		// stream never created!
-		return nil, fmt.Errorf("received frame for stream ID %d: stream never created", streamID)
+		return nil, status.Errorf(codes.Internal, "protocol error: received frame for stream ID %d: stream never created", streamID)
 	}
 
 	return target, nil
@@ -320,8 +352,8 @@ type tunnelServerStream struct {
 	isClientStream bool
 	isServerStream bool
 
-	sender     sender
-	receiver   receiver[tunnelpb.ClientToServerFrame]
+	sender     *sender
+	receiver   *receiver[tunnelpb.ClientToServerFrame]
 	halfClosed atomic.Pointer[errHolder]
 
 	// for reading frames from channel, to read message data
@@ -358,7 +390,7 @@ func (st *tunnelServerStream) acceptClientFrame(frame tunnelpb.ClientToServerFra
 		st.sender.updateWindow(frame.WindowUpdate)
 
 	case nil:
-		st.finishStream(errors.New("protocol error: unrecognized frame type"))
+		st.finishStream(status.Error(codes.Internal, "protocol error: unrecognized frame type"))
 
 	default:
 		if err := st.receiver.accept(frame); err != nil {

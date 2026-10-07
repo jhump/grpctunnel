@@ -2,13 +2,14 @@ package grpctunnel
 
 import (
 	"context"
-	"google.golang.org/grpc/metadata"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/fullstorydev/grpchan"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/jhump/grpctunnel/tunnelpb"
@@ -18,6 +19,25 @@ const (
 	grpctunnelNegotiateKey = "grpctunnel-negotiate"
 	grpctunnelNegotiateVal = "on"
 )
+
+// tunnelRoles returns how to refer to the tunnel server and the tunnel client
+// in error messages. In a forward tunnel, the tunnel roles are the same as the
+// network roles, so these are just "server" and "client". In a reverse tunnel,
+// the network client acts as the tunnel server and the network server acts as
+// the tunnel client, so both roles are named, to make it clear which is which.
+func tunnelRoles(reverse bool) (tunnelServer, tunnelClient string) {
+	if reverse {
+		return "tunnel server (network client)", "tunnel client (network server)"
+	}
+	return "server", "client"
+}
+
+// supportedRevisions are the protocol revisions supported by this package.
+// The latest revision that both peers support is used.
+var supportedRevisions = []tunnelpb.ProtocolRevision{
+	tunnelpb.ProtocolRevision_REVISION_ONE,
+	tunnelpb.ProtocolRevision_REVISION_TWO,
+}
 
 // TunnelServiceHandler provides an implementation for TunnelServiceServer. You
 // can register handlers with it, and it will then expose those handlers for
@@ -70,10 +90,40 @@ type TunnelServiceHandlerOptions struct {
 	// server interceptors ran when the tunnel was opened, then any values they
 	// store in the context is also available.
 	AffinityKey func(TunnelChannel) any
-
-	// If true, flow control will be disabled, even when the network client
-	// supports flow control.
-	DisableFlowControl bool
+	// If non-zero, sets the initial flow control window size for receiving data.
+	// (The peer sets the initial window size for sending data.) If zero, the
+	// initial window size defaults to 64k. Values less than 1k will be increased
+	// to 1k. Increasing this may increase total throughput at the cost of more
+	// memory usage.
+	InitialWindowSize uint32
+	// If non-zero, sets the maximum size of a single chunk of data to send. This
+	// will be clamped to the peer's initial window size if set to a larger value.
+	// If zero, the default max chunk size is 16k. Increasing this can allow larger
+	// messages to be sent more quickly (fewer chunks, fewer flow control messages)
+	// but at the potential cost of fairness, in the event that multiple streams
+	// are trying to concurrently send large messages.
+	MaxChunkSize uint32
+	// The minimum size for a flow control window update message. This will be
+	// clamped to the initial window size if set to a larger value. When receiving
+	// data, a window update will not be sent unless there is at least this amount
+	// outstanding (i.e. this many bytes to acknowledge). When unset or zero, this
+	// will default to 16k. When set to one, there is effectively no minimum, and an
+	// update window message will be sent for every chunk received, regardless of how
+	// small. (When RPC traffic consists of a lot of small messages, this can result
+	// in high bandwidth overhead for flow control management.) A larger value means
+	// fewer window update messages (and thus less overhead for flow control
+	// management), but too large a value, especially combined with RPC traffic that
+	// uses large messages, could mean an increase in latency while the sender waits
+	// for the large update window message before it can send more data.
+	MinWindowUpdateSize uint32
+	// Limits how long it can take to establish a reverse tunnel, opened by a
+	// client that uses a ReverseTunnelServer. If the tunnel is not established
+	// within this time, it fails with a FailedPrecondition error. If zero, the
+	// default of 15 seconds is used. If negative, there is no limit.
+	//
+	// This does not apply to forward tunnels: the client limits how long it
+	// can take to establish those (see WithEstablishmentTimeout).
+	EstablishmentTimeout time.Duration
 }
 
 // NewTunnelServiceHandler creates a new TunnelServiceHandler. The options are
@@ -84,7 +134,7 @@ type TunnelServiceHandlerOptions struct {
 // The handler's Service method can be used to actually register the handler
 // with a *grpc.Server (or other grpc.ServiceRegistrar).
 func NewTunnelServiceHandler(options TunnelServiceHandlerOptions) *TunnelServiceHandler {
-	return &TunnelServiceHandler{
+	handler := &TunnelServiceHandler{
 		handlers:                  grpchan.HandlerMap{},
 		noReverseTunnels:          options.NoReverseTunnels,
 		onReverseTunnelConnect:    options.OnReverseTunnelOpen,
@@ -93,9 +143,14 @@ func NewTunnelServiceHandler(options TunnelServiceHandlerOptions) *TunnelService
 		reverse:                   newReverseChannels(),
 		reverseByKey:              map[any]*reverseChannels{},
 		tunnelOpts: tunnelOpts{
-			disableFlowControl: options.DisableFlowControl,
+			initialWindowSize:    options.InitialWindowSize,
+			maxChunkSize:         options.MaxChunkSize,
+			minWindowUpdateSize:  options.MinWindowUpdateSize,
+			establishmentTimeout: options.EstablishmentTimeout,
 		},
 	}
+	initOptions(&handler.tunnelOpts, nil)
+	return handler
 }
 
 var _ grpc.ServiceRegistrar = (*TunnelServiceHandler)(nil)
@@ -144,7 +199,7 @@ func (s *TunnelServiceHandler) openTunnel(stream tunnelpb.TunnelService_OpenTunn
 	vals := md.Get(grpctunnelNegotiateKey)
 	clientAcceptsSettings := len(vals) > 0 && vals[0] == grpctunnelNegotiateVal
 	stream = &threadSafeOpenTunnelServer{TunnelService_OpenTunnelServer: stream}
-	return serveTunnel(stream, md, clientAcceptsSettings, &s.tunnelOpts, s.handlers, s.stopping.Load)
+	return serveTunnel(stream, md, clientAcceptsSettings, false, &s.tunnelOpts, s.handlers, s.stopping.Load)
 }
 
 // openReverseTunnel creates a reverse tunnel from this server to the RPC client.
@@ -165,6 +220,12 @@ func (s *TunnelServiceHandler) openReverseTunnel(stream tunnelpb.TunnelService_O
 
 	ch := newReverseChannel(stream, &s.tunnelOpts, s.unregister)
 	defer ch.Close()
+	select {
+	case <-ch.Done():
+		// The tunnel was never established.
+		return ch.Err()
+	default:
+	}
 
 	var key any
 	if s.affinityKey != nil {
