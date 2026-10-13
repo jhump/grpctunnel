@@ -1,3 +1,9 @@
+# Linters are versioned in internal/tools/go.mod and run with "go tool", so
+# the versions are pinned, they share compatible versions of dependencies
+# (like golang.org/x/tools), and there's no chance of running some other
+# installed binary of the same name.
+GO_TOOL := go tool -modfile=internal/tools/go.mod
+
 .PHONY: ci
 ci: deps checkgofmt errcheck golint vet ineffassign staticcheck test
 
@@ -29,23 +35,19 @@ vet:
 
 .PHONY: staticcheck
 staticcheck:
-	@go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
-	staticcheck ./...
+	$(GO_TOOL) staticcheck ./...
 
 .PHONY: ineffassign
 ineffassign:
-	@go install github.com/gordonklaus/ineffassign@v0.2.0
-	ineffassign .
+	$(GO_TOOL) ineffassign .
 
 .PHONY: golint
 golint:
-	@go install golang.org/x/lint/golint@v0.0.0-20210508222113-6edffad5e616
-	golint -min_confidence 0.9 -set_exit_status ./...
+	$(GO_TOOL) golint -min_confidence 0.9 -set_exit_status ./...
 
 .PHONY: errcheck
 errcheck:
-	@go install github.com/kisielk/errcheck@v1.20.0
-	errcheck ./...
+	$(GO_TOOL) errcheck ./...
 
 .PHONY: test
 test:
