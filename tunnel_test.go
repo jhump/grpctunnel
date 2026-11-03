@@ -21,8 +21,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	"github.com/jhump/grpctunnel/tunnelpb"
 )
@@ -399,6 +401,34 @@ func TestTunnelServiceHandler_TrailersAvailableAtEOF(t *testing.T) {
 		})
 	}
 	require.NoError(t, grp.Wait())
+}
+
+func TestTunnelServiceHandler_CloseSendAfterStreamFailed(t *testing.T) {
+	// Regression test: CloseSend should not return the RPC's status if the
+	// server has already failed the stream. That status is reported by Recv,
+	// which matches the behavior of grpc-go.
+	var svr grpchantesting.TestServer
+	tunnelCli, _ := setupInProcessServer(&svr)
+	ch, err := NewChannel(tunnelCli).Start(t.Context())
+	require.NoError(t, err)
+	defer func() {
+		ch.Close()
+		<-ch.Done()
+	}()
+	stub := grpchantesting.NewTestServiceClient(ch)
+	stream, err := stub.BidiStream(t.Context())
+	require.NoError(t, err)
+	err = stream.Send(&grpchantesting.Message{Code: int32(codes.DataLoss)})
+	require.NoError(t, err)
+	// Wait for the server to fail the RPC.
+	for {
+		_, err = stream.Recv()
+		if err != nil {
+			break
+		}
+	}
+	require.Equal(t, codes.DataLoss, status.Code(err))
+	require.NoError(t, stream.CloseSend())
 }
 
 // TODO: also need more tests around channel lifecycle, and ensuring it
