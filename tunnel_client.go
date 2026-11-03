@@ -719,7 +719,9 @@ func (st *tunnelClientStream) CloseSend() error {
 
 	select {
 	case <-st.doneSignal:
-		return st.loadDone()
+		// Like grpc-go, we don't report the RPC's status here. If the
+		// stream is already done, the caller learns why via RecvMsg.
+		return nil
 	default:
 		// don't block since we are holding writeMu
 	}
